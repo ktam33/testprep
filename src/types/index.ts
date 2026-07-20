@@ -32,6 +32,23 @@ export interface CategoryStat {
   correct: number;
 }
 
+export type FigureKind = 'none' | 'table' | 'bar' | 'line' | 'scatter';
+
+export interface FigureSeries {
+  label: string;
+  points: { x: number; y: number }[];
+}
+
+export interface Figure {
+  kind: FigureKind;
+  title: string;
+  xLabel: string;
+  yLabel: string;
+  columns: string[]; // only meaningful when kind === 'table'
+  rows: string[][]; // only meaningful when kind === 'table'
+  series: FigureSeries[]; // only meaningful when kind is a chart type
+}
+
 export interface Passage {
   id: number;
   testAttemptId: number;
@@ -39,6 +56,7 @@ export interface Passage {
   passageType: string | null;
   title: string | null;
   body: string;
+  figure: Figure | null;
 }
 
 export interface Question {
@@ -53,6 +71,7 @@ export interface Question {
   correctAnswerIndex: number | null; // null when stripped for an in-progress attempt
   explanation: string | null; // null when stripped for an in-progress attempt
   difficulty: Difficulty | null;
+  figure: Figure | null;
 }
 
 export interface QuestionResponse {
@@ -102,6 +121,7 @@ export interface GeneratedQuestion {
   choices: string[];
   correctAnswerIndex: number;
   explanation: string;
+  figure?: Figure; // present only when the schema requested it (Math questions)
 }
 
 export interface GeneratedPassage {
@@ -110,6 +130,7 @@ export interface GeneratedPassage {
   type: string;
   body: string;
   questions: GeneratedQuestion[];
+  figure?: Figure; // present only when the schema requested it (Science passages)
 }
 
 export interface GeneratedPassageTest {

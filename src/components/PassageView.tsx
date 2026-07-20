@@ -1,5 +1,6 @@
 import { ReactNode } from 'react';
 import { Passage } from '@/types';
+import FigureView from './FigureView';
 
 export default function PassageView({ passage, children }: { passage: Passage; children: ReactNode }) {
   return (
@@ -10,6 +11,7 @@ export default function PassageView({ passage, children }: { passage: Passage; c
       </p>
       {passage.title && <h3 className="mb-3 text-lg font-semibold text-gray-900">{passage.title}</h3>}
       <p className="mb-6 whitespace-pre-line leading-relaxed text-gray-700">{passage.body}</p>
+      <FigureView figure={passage.figure} />
       <div className="space-y-6">{children}</div>
     </section>
   );
