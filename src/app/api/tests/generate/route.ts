@@ -14,14 +14,19 @@ import {
   PassageAssignment,
 } from '@/utils/passageLayout';
 import { buildMathTestSchema, buildPassageTestSchema } from '@/utils/schemas';
+import { validateFigure } from '@/utils/figureValidation';
 import {
   Section,
   SECTION_LABELS,
   SECTIONS,
+  Figure,
   GeneratedMathTest,
   GeneratedPassageTest,
   GeneratedQuestion,
 } from '@/types';
+
+// Science categories that are meaningless without an actual table/graph to look at.
+const DATA_INTERPRETATION_CATEGORIES = new Set(['Tables', 'Graphs', 'Trends & Data Comparison']);
 
 // Generation can now take up to three model calls (generate, one retry, one review pass).
 export const maxDuration = 180;
@@ -43,10 +48,7 @@ function buildSystemMessage(section: Section): string {
 }
 
 function buildPassageUserMessage(section: Section, passages: PassageAssignment[]): string {
-  const lengthGuidance =
-    section === 'science'
-      ? 'about 150-300 words describing an experiment, study, or dataset in prose (this is text-only, so describe any tables/graphs/figures in words rather than actually rendering a table)'
-      : 'about 250-400 words';
+  const lengthGuidance = section === 'science' ? 'about 150-300 words' : 'about 250-400 words';
 
   const totalQuestions = passages.reduce((sum, p) => sum + p.questionCount, 0);
 
@@ -56,6 +58,13 @@ function buildPassageUserMessage(section: Section, passages: PassageAssignment[]
         `Passage ${p.index} (type: "${p.type}"): write ${lengthGuidance}, followed by exactly ${p.questionCount} questions (question "index" 0-${p.questionCount - 1} within this passage). Suggested category mix for this passage's questions: ${formatTally(p.categoryNames)}.`
     )
     .join('\n');
+
+  const figureGuidance =
+    section === 'science'
+      ? `
+Each passage has a "figure" field. For any passage whose questions include Tables, Graphs, or Trends & Data Comparison (especially "Data Representation" passages), set "figure" to a real table (kind: "table", with columns/rows of concrete data) or chart (kind: "bar"/"line"/"scatter", with 1-3 series of concrete x/y points) — do not just describe numbers in the passage body prose, reference the figure instead ("the table below shows...", "as shown in the graph..."). Keep charts to a small number of points/categories (roughly 4-8) so they stay legible. "Research Summary" and "Conflicting Viewpoints" passages may also include a table if it strengthens the item. For any passage with no figure, set "figure" to exactly { "kind": "none", "title": "", "xLabel": "", "yLabel": "", "columns": [], "rows": [], "series": [] }.
+`
+      : '';
 
   return `Generate a full ${SECTION_LABELS[section]} practice test with exactly ${passages.length} passages and ${totalQuestions} total questions.
 
@@ -68,7 +77,7 @@ For every question:
 - correctAnswerIndex is 0-based (0-3).
 - category must exactly match one of the category names listed above for that question's passage.
 - explanation should be 1-2 sentences justifying the correct answer, written for a 9th-grade student.
-
+${figureGuidance}
 Passage "index" fields must be 0-${passages.length - 1}, in the order listed above.`;
 }
 
@@ -84,7 +93,8 @@ For every question:
 - correctAnswerIndex is 0-based (0-3).
 - category must exactly match one of the category names listed above.
 - explanation should be 1-2 sentences justifying the correct answer, written for a 9th-grade student.
-- index is the question's 0-based position in the overall 30-question test (0-29).`;
+- index is the question's 0-based position in the overall 30-question test (0-29).
+- Every question has a "figure" field. For Statistics & Probability, Coordinate Plane & Graphing, and Slope & Linear Relationships questions, often (not always) give it a real table (kind: "table") or chart (kind: "bar"/"line"/"scatter", with concrete x/y points, roughly 4-8 points for legibility) that the question actually depends on. For all other questions, and for any of those categories where a figure isn't a natural fit, set "figure" to exactly { "kind": "none", "title": "", "xLabel": "", "yLabel": "", "columns": [], "rows": [], "series": [] }.`;
 }
 
 function buildReviewSystemMessage(section: Section): string {
@@ -118,6 +128,14 @@ function validateGenerated(
     if (questions.length !== 30) {
       return { ok: false, reason: `Expected exactly 30 questions total, got ${questions.length}. Generate exactly 30.` };
     }
+    for (const q of questions) {
+      if (q.figure) {
+        const figureCheck = validateFigure(q.figure);
+        if (!figureCheck.ok) {
+          return { ok: false, reason: `Question ${q.index}: ${figureCheck.reason}` };
+        }
+      }
+    }
     return { ok: true };
   }
 
@@ -143,7 +161,30 @@ function validateGenerated(
   if (total !== 30) {
     return { ok: false, reason: `Expected 30 total questions across all passages, got ${total}.` };
   }
+
+  if (section === 'science') {
+    for (const p of passages) {
+      if (p.figure) {
+        const figureCheck = validateFigure(p.figure);
+        if (!figureCheck.ok) {
+          return { ok: false, reason: `Passage ${p.index}: ${figureCheck.reason}` };
+        }
+      }
+      const needsFigure = p.questions.some((q) => DATA_INTERPRETATION_CATEGORIES.has(q.category));
+      if (needsFigure && (!p.figure || p.figure.kind === 'none')) {
+        return {
+          ok: false,
+          reason: `Passage ${p.index} ("${p.type}") has a Tables/Graphs/Trends & Data Comparison question but figure.kind is "none". Give it a real "table" or chart figure with concrete data.`,
+        };
+      }
+    }
+  }
+
   return { ok: true };
+}
+
+function collapseFigure(figure: Figure | undefined): Figure | null {
+  return !figure || figure.kind === 'none' ? null : figure;
 }
 
 function flattenGenerated(
@@ -162,6 +203,7 @@ function flattenGenerated(
         choices: q.choices,
         correctAnswerIndex: q.correctAnswerIndex,
         explanation: q.explanation,
+        figure: collapseFigure(q.figure),
       })
     );
     return { passages: [], questions };
@@ -173,6 +215,7 @@ function flattenGenerated(
     passageType: p.type,
     title: p.title,
     body: p.body,
+    figure: collapseFigure(p.figure),
   }));
 
   let runningIndex = 0;
@@ -188,6 +231,7 @@ function flattenGenerated(
         choices: q.choices,
         correctAnswerIndex: q.correctAnswerIndex,
         explanation: q.explanation,
+        figure: null, // passage-based questions never carry their own figure — it lives on the passage
       });
     });
   });
@@ -249,7 +293,9 @@ export async function POST(request: NextRequest) {
     }
 
     const schema =
-      layout.kind === 'passages' ? buildPassageTestSchema(categoryNames) : buildMathTestSchema(categoryNames);
+      layout.kind === 'passages'
+        ? buildPassageTestSchema(categoryNames, { passagesHaveFigure: section === 'science' })
+        : buildMathTestSchema(categoryNames);
 
     const systemMessage = buildSystemMessage(section);
     const userMessage =

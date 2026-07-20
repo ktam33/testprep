@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { Figure } from '@/types';
 import {
   createDb,
   createUser,
@@ -92,6 +93,7 @@ describe('getCategoryStats', () => {
           choices: ['a', 'b', 'c', 'd'],
           correctAnswerIndex: 0,
           explanation: 'because',
+          figure: null,
         },
         {
           questionIndex: 1,
@@ -102,6 +104,7 @@ describe('getCategoryStats', () => {
           choices: ['a', 'b', 'c', 'd'],
           correctAnswerIndex: 1,
           explanation: 'because',
+          figure: null,
         },
         {
           questionIndex: 2,
@@ -112,6 +115,7 @@ describe('getCategoryStats', () => {
           choices: ['a', 'b', 'c', 'd'],
           correctAnswerIndex: 2,
           explanation: 'because',
+          figure: null,
         },
       ]
     );
@@ -153,6 +157,7 @@ describe('getCategoryStats', () => {
           choices: ['a', 'b', 'c', 'd'],
           correctAnswerIndex: 0,
           explanation: 'because',
+          figure: null,
         },
       ]
     );
@@ -175,7 +180,7 @@ describe('persistGeneratedTest + getAttemptDetail', () => {
       db,
       user.id,
       'english',
-      [{ passageIndex: 0, passageType: 'English Passage', title: 'T', body: 'Body text.' }],
+      [{ passageIndex: 0, passageType: 'English Passage', title: 'T', body: 'Body text.', figure: null }],
       [
         {
           questionIndex: 0,
@@ -186,6 +191,7 @@ describe('persistGeneratedTest + getAttemptDetail', () => {
           choices: ['a', 'b', 'c', 'd'],
           correctAnswerIndex: 1,
           explanation: 'explanation text',
+          figure: null,
         },
       ]
     );
@@ -208,6 +214,116 @@ describe('persistGeneratedTest + getAttemptDetail', () => {
   }
 });
 
+describe('figure persistence', () => {
+  it('round-trips a table figure on a passage and a chart figure on a question', () => {
+    const user = createUser(db, 'Alice');
+    const [scienceCat] = categoryIdsFor('science');
+    const [mathCat] = categoryIdsFor('math');
+
+    const tableFigure: Figure = {
+      kind: 'table',
+      title: 'Trial Results',
+      xLabel: '',
+      yLabel: '',
+      columns: ['Trial', 'Temperature (C)'],
+      rows: [
+        ['1', '20'],
+        ['2', '25'],
+      ],
+      series: [],
+    };
+    const chartFigure: Figure = {
+      kind: 'bar',
+      title: 'Dice Roll Frequency',
+      xLabel: 'Roll',
+      yLabel: 'Frequency',
+      columns: [],
+      rows: [],
+      series: [{ label: 'Trials', points: [{ x: 1, y: 4 }, { x: 2, y: 7 }] }],
+    };
+
+    const attemptId = persistGeneratedTest(
+      db,
+      user.id,
+      'science',
+      [{ passageIndex: 0, passageType: 'Data Representation A', title: 'T', body: 'Body', figure: tableFigure }],
+      [
+        {
+          questionIndex: 0,
+          passageIndex: 0,
+          categoryName: scienceCat.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: null, // passage-based questions never carry their own figure
+        },
+      ]
+    );
+
+    const mathAttemptId = persistGeneratedTest(
+      db,
+      user.id,
+      'math',
+      [],
+      [
+        {
+          questionIndex: 0,
+          passageIndex: null,
+          categoryName: mathCat.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: chartFigure,
+        },
+      ]
+    );
+
+    const scienceDetail = getAttemptDetail(db, attemptId, { includeAnswers: true })!;
+    expect(scienceDetail.passages[0].figure).toEqual(tableFigure);
+    expect(scienceDetail.questions[0].figure).toBeNull();
+
+    const mathDetail = getAttemptDetail(db, mathAttemptId, { includeAnswers: true })!;
+    expect(mathDetail.questions[0].figure).toEqual(chartFigure);
+  });
+
+  it('stores null (not a stringified "none") when there is no figure', () => {
+    const user = createUser(db, 'Alice');
+    const [cat1] = categoryIdsFor('math');
+
+    const attemptId = persistGeneratedTest(
+      db,
+      user.id,
+      'math',
+      [],
+      [
+        {
+          questionIndex: 0,
+          passageIndex: null,
+          categoryName: cat1.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: null,
+        },
+      ]
+    );
+
+    const raw = db.prepare('SELECT figure FROM questions WHERE test_attempt_id = ?').get(attemptId) as {
+      figure: string | null;
+    };
+    expect(raw.figure).toBeNull();
+
+    const detail = getAttemptDetail(db, attemptId, { includeAnswers: true })!;
+    expect(detail.questions[0].figure).toBeNull();
+  });
+});
+
 describe('submitAttempt + getProgressSummary', () => {
   it('grades a test and reflects results in the dashboard summary', () => {
     const user = createUser(db, 'Alice');
@@ -217,7 +333,7 @@ describe('submitAttempt + getProgressSummary', () => {
       db,
       user.id,
       'reading',
-      [{ passageIndex: 0, passageType: 'Literary Narrative', title: 'T', body: 'Body' }],
+      [{ passageIndex: 0, passageType: 'Literary Narrative', title: 'T', body: 'Body', figure: null }],
       [
         {
           questionIndex: 0,
@@ -228,6 +344,7 @@ describe('submitAttempt + getProgressSummary', () => {
           choices: ['a', 'b', 'c', 'd'],
           correctAnswerIndex: 0,
           explanation: 'x',
+          figure: null,
         },
         {
           questionIndex: 1,
@@ -238,6 +355,7 @@ describe('submitAttempt + getProgressSummary', () => {
           choices: ['a', 'b', 'c', 'd'],
           correctAnswerIndex: 0,
           explanation: 'x',
+          figure: null,
         },
       ]
     );

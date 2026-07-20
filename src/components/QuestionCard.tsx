@@ -1,4 +1,5 @@
 import { Question } from '@/types';
+import FigureView from './FigureView';
 
 interface QuestionCardProps {
   question: Question;
@@ -20,6 +21,7 @@ export default function QuestionCard({
       <p className="mb-3 font-medium text-gray-900">
         {questionNumber}. {question.prompt}
       </p>
+      <FigureView figure={question.figure} />
       <div className="space-y-2">
         {question.choices.map((choice, i) => {
           const isSelected = selectedAnswerIndex === i;

@@ -6,6 +6,7 @@ import { gradeQuestions, GradableQuestion } from './grading';
 import {
   CategoryStat,
   Difficulty,
+  Figure,
   Passage,
   Question,
   QuestionResponse,
@@ -52,7 +53,8 @@ CREATE TABLE IF NOT EXISTS passages (
   passage_index   INTEGER NOT NULL,
   passage_type    TEXT,
   title           TEXT,
-  body            TEXT NOT NULL
+  body            TEXT NOT NULL,
+  figure          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS questions (
@@ -65,7 +67,8 @@ CREATE TABLE IF NOT EXISTS questions (
   choices               TEXT NOT NULL,
   correct_answer_index  INTEGER NOT NULL,
   explanation           TEXT NOT NULL,
-  difficulty            TEXT CHECK (difficulty IN ('easy','medium','hard'))
+  difficulty            TEXT CHECK (difficulty IN ('easy','medium','hard')),
+  figure                TEXT
 );
 
 CREATE TABLE IF NOT EXISTS responses (
@@ -84,6 +87,16 @@ CREATE INDEX IF NOT EXISTS idx_passages_attempt    ON passages(test_attempt_id);
 
 function defaultDbPath(): string {
   return path.join(process.cwd(), 'data', 'preact-testprep.sqlite3');
+}
+
+// Handles existing on-disk databases created before a column existed —
+// `CREATE TABLE IF NOT EXISTS` only affects brand-new databases.
+function ensureColumn(db: Database.Database, table: string, column: string, ddlType: string) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddlType}`);
+    console.log(`🟢 [DB] Migrated: added ${table}.${column}`);
+  }
 }
 
 function seedCategories(db: Database.Database) {
@@ -108,6 +121,8 @@ export function createDb(filePath: string = defaultDbPath()): Database.Database 
   db.pragma('foreign_keys = ON');
   if (filePath !== ':memory:') db.pragma('journal_mode = WAL');
   db.exec(SCHEMA);
+  ensureColumn(db, 'passages', 'figure', 'TEXT');
+  ensureColumn(db, 'questions', 'figure', 'TEXT');
   seedCategories(db);
   return db;
 }
@@ -153,6 +168,7 @@ function mapPassageRow(row: any): Passage {
     passageType: row.passage_type,
     title: row.title,
     body: row.body,
+    figure: row.figure ? JSON.parse(row.figure) : null,
   };
 }
 
@@ -169,6 +185,7 @@ function mapQuestionRow(row: any, includeAnswers: boolean): Question {
     correctAnswerIndex: includeAnswers ? row.correct_answer_index : null,
     explanation: includeAnswers ? row.explanation : null,
     difficulty: row.difficulty,
+    figure: row.figure ? JSON.parse(row.figure) : null,
   };
 }
 
@@ -263,6 +280,7 @@ export interface PersistPassageInput {
   passageType: string;
   title: string;
   body: string;
+  figure: Figure | null;
 }
 
 export interface PersistQuestionInput {
@@ -274,6 +292,7 @@ export interface PersistQuestionInput {
   choices: string[];
   correctAnswerIndex: number;
   explanation: string;
+  figure: Figure | null;
 }
 
 export function persistGeneratedTest(
@@ -294,12 +313,12 @@ export function persistGeneratedTest(
     'INSERT INTO test_attempts (user_id, section, num_questions) VALUES (?, ?, ?)'
   );
   const insertPassage = db.prepare(
-    'INSERT INTO passages (test_attempt_id, passage_index, passage_type, title, body) VALUES (?, ?, ?, ?, ?)'
+    'INSERT INTO passages (test_attempt_id, passage_index, passage_type, title, body, figure) VALUES (?, ?, ?, ?, ?, ?)'
   );
   const insertQuestion = db.prepare(
     `INSERT INTO questions
-      (test_attempt_id, passage_id, category_id, question_index, prompt, choices, correct_answer_index, explanation, difficulty)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      (test_attempt_id, passage_id, category_id, question_index, prompt, choices, correct_answer_index, explanation, difficulty, figure)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
 
   const run = db.transaction(() => {
@@ -307,8 +326,14 @@ export function persistGeneratedTest(
 
     const passageIdByIndex = new Map<number, number>();
     for (const p of passages) {
-      const passageId = insertPassage.run(attemptId, p.passageIndex, p.passageType, p.title, p.body)
-        .lastInsertRowid as number;
+      const passageId = insertPassage.run(
+        attemptId,
+        p.passageIndex,
+        p.passageType,
+        p.title,
+        p.body,
+        p.figure ? JSON.stringify(p.figure) : null
+      ).lastInsertRowid as number;
       passageIdByIndex.set(p.passageIndex, passageId);
     }
 
@@ -327,7 +352,8 @@ export function persistGeneratedTest(
         JSON.stringify(q.choices),
         q.correctAnswerIndex,
         q.explanation,
-        q.difficulty
+        q.difficulty,
+        q.figure ? JSON.stringify(q.figure) : null
       );
     }
 
