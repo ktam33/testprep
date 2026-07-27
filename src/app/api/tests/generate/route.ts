@@ -43,6 +43,11 @@ const REASONING_EFFORT = (process.env.OPENAI_REASONING_EFFORT ?? 'low') as 'low'
 const REVIEW_SOFT_DEADLINE_MS = 150_000;
 const MIN_REVIEW_MS = 25_000;
 
+// How many times to (re)generate a single passage before giving up. Each passage is a
+// small, independent call, so extra attempts are cheap and dramatically cut the chance
+// that one bad passage (validation failure OR timeout) fails the whole test.
+const MAX_PASSAGE_ATTEMPTS = 3;
+
 function tallyCategories(names: string[]): Record<string, number> {
   const tally: Record<string, number> = {};
   for (const n of names) tally[n] = (tally[n] ?? 0) + 1;
@@ -87,7 +92,9 @@ Two kinds of segment:
 - Plain prose: set "questionRef" to -1.
 - An UNDERLINED PORTION governed by a question: set "questionRef" to the 0-based "index" of that question within THIS passage's questions array. Each underlined portion points to exactly one question, and no two point to the same question.
 
-For each passage, make MOST questions (at least 4 of the ${passages[0]?.questionCount ?? 6}) underlined-portion questions, and the rest whole-passage rhetorical questions:
+For each passage, make MOST questions (at least 4 of the ${passages[0]?.questionCount ?? 6}) underlined-portion questions, and the rest whole-passage rhetorical questions.
+
+MANDATORY: every question whose category is in Grammar & Usage, Punctuation, or Sentence Structure MUST be an underlined-portion question — there must be exactly one segment whose questionRef equals that question's 0-based index. Do not leave any such question without a segment. ONLY the four Rhetorical Skills categories (Organization & Paragraph Structure; Main Idea & Supporting Details; Style, Tone & Conciseness; Purpose & Audience) may be whole-passage questions with no segment pointing to them.
 
 UNDERLINED-PORTION questions (use for Grammar & Usage, Punctuation, and Sentence Structure categories):
 - The underlined segment's "text" is exactly the words the student is evaluating — it lives in the passage and is shown underlined. The question stem is the underline itself, so set that question's "prompt" to "" (empty string), unless the item asks something specific like conciseness or word choice, in which case a short stem such as "Which choice is most concise?" is fine.
@@ -434,10 +441,12 @@ export async function POST(request: NextRequest) {
       return parsed;
     }
 
-    // Generates one passage (with its questions) in its own call, retrying once on a
-    // validation failure. Passages are produced this way in parallel: a single call for all
+    // Generates one passage (with its questions) in its own call, retrying up to
+    // MAX_PASSAGE_ATTEMPTS times on EITHER a validation failure OR an exception (timeout /
+    // transient API error). Passages are produced this way in parallel: a single call for all
     // five passages exceeds the per-call timeout for English, so splitting into several small
-    // concurrent calls makes total wall time roughly the slowest single passage.
+    // concurrent calls makes total wall time roughly the slowest single passage — and each
+    // passage self-heals rather than one bad call failing the entire test.
     async function generateOnePassage(pa: PassageAssignment): Promise<GeneratedPassage> {
       // Reuse the passage prompt for a single passage rendered at index 0; assembly below
       // re-derives the real passage index, so the model's own index field is irrelevant.
@@ -449,15 +458,29 @@ export async function POST(request: NextRequest) {
         return list[0] as GeneratedPassage;
       };
 
-      let passage = extract(await runCompletion(message));
-      let res = validatePassage(section, passage, expected);
-      if (!res.ok) {
-        console.log(`⚠️ [GENERATE API] Passage ${pa.index} validation failed, retrying once:`, res.reason);
-        passage = extract(await runCompletion(`${message}\n\nIMPORTANT CORRECTION: ${res.reason}`));
-        res = validatePassage(section, passage, expected);
-        if (!res.ok) throw new Error(`Passage ${pa.index} failed validation after retry: ${res.reason}`);
+      let correction = ''; // set only from validation failures — something the model can fix
+      let lastFailure = '';
+      for (let attempt = 1; attempt <= MAX_PASSAGE_ATTEMPTS; attempt++) {
+        const content = correction ? `${message}\n\nIMPORTANT CORRECTION: ${correction}` : message;
+        try {
+          const passage = extract(await runCompletion(content));
+          const res = validatePassage(section, passage, expected);
+          if (res.ok) {
+            if (attempt > 1) console.log(`✅ [GENERATE API] Passage ${pa.index} succeeded on attempt ${attempt}`);
+            return passage;
+          }
+          lastFailure = res.reason;
+          correction = res.reason; // guide the next attempt toward the specific fix
+          console.log(`⚠️ [GENERATE API] Passage ${pa.index} attempt ${attempt} invalid: ${res.reason}`);
+        } catch (err: any) {
+          // A timeout or transient API error is not something the model can "correct", so we
+          // keep any prior validation correction and simply try again with a short backoff.
+          lastFailure = err?.message ?? String(err);
+          console.log(`⚠️ [GENERATE API] Passage ${pa.index} attempt ${attempt} errored: ${lastFailure}`);
+        }
+        if (attempt < MAX_PASSAGE_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 750));
       }
-      return passage;
+      throw new Error(`Passage ${pa.index} failed after ${MAX_PASSAGE_ATTEMPTS} attempts: ${lastFailure}`);
     }
 
     let parsed: GeneratedMathTest | GeneratedPassageTest;
