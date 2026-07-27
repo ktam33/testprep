@@ -8,6 +8,7 @@ import {
   Difficulty,
   Figure,
   Passage,
+  PassageSegment,
   Question,
   QuestionResponse,
   Section,
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS passages (
   passage_type    TEXT,
   title           TEXT,
   body            TEXT NOT NULL,
+  segments        TEXT,
   figure          TEXT
 );
 
@@ -122,6 +124,7 @@ export function createDb(filePath: string = defaultDbPath()): Database.Database 
   if (filePath !== ':memory:') db.pragma('journal_mode = WAL');
   db.exec(SCHEMA);
   ensureColumn(db, 'passages', 'figure', 'TEXT');
+  ensureColumn(db, 'passages', 'segments', 'TEXT');
   ensureColumn(db, 'questions', 'figure', 'TEXT');
   seedCategories(db);
   return db;
@@ -168,6 +171,7 @@ function mapPassageRow(row: any): Passage {
     passageType: row.passage_type,
     title: row.title,
     body: row.body,
+    segments: row.segments ? JSON.parse(row.segments) : null,
     figure: row.figure ? JSON.parse(row.figure) : null,
   };
 }
@@ -280,6 +284,7 @@ export interface PersistPassageInput {
   passageType: string;
   title: string;
   body: string;
+  segments: PassageSegment[] | null;
   figure: Figure | null;
 }
 
@@ -313,7 +318,7 @@ export function persistGeneratedTest(
     'INSERT INTO test_attempts (user_id, section, num_questions) VALUES (?, ?, ?)'
   );
   const insertPassage = db.prepare(
-    'INSERT INTO passages (test_attempt_id, passage_index, passage_type, title, body, figure) VALUES (?, ?, ?, ?, ?, ?)'
+    'INSERT INTO passages (test_attempt_id, passage_index, passage_type, title, body, segments, figure) VALUES (?, ?, ?, ?, ?, ?, ?)'
   );
   const insertQuestion = db.prepare(
     `INSERT INTO questions
@@ -332,6 +337,7 @@ export function persistGeneratedTest(
         p.passageType,
         p.title,
         p.body,
+        p.segments ? JSON.stringify(p.segments) : null,
         p.figure ? JSON.stringify(p.figure) : null
       ).lastInsertRowid as number;
       passageIdByIndex.set(p.passageIndex, passageId);

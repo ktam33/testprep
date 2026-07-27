@@ -19,7 +19,7 @@ export default function QuestionCard({
   return (
     <div className="border-t border-gray-100 pt-4 first:border-0 first:pt-0">
       <p className="mb-3 font-medium text-gray-900">
-        {questionNumber}. {question.prompt}
+        {questionNumber}.{question.prompt ? ` ${question.prompt}` : ''}
       </p>
       <FigureView figure={question.figure} />
       <div className="space-y-2">

@@ -49,6 +49,15 @@ export interface Figure {
   series: FigureSeries[]; // only meaningful when kind is a chart type
 }
 
+// One run of an English passage body. Most runs are plain prose; a few are the
+// numbered "underlined" portions that a specific question governs (the real PreACT
+// English format). questionRef is a 0-based index into the passage's questions array,
+// or -1 for a plain-prose run (sentinel over null to match the house strict-mode style).
+export interface PassageSegment {
+  text: string;
+  questionRef: number;
+}
+
 export interface Passage {
   id: number;
   testAttemptId: number;
@@ -56,6 +65,7 @@ export interface Passage {
   passageType: string | null;
   title: string | null;
   body: string;
+  segments: PassageSegment[] | null; // English passages only; null for other sections
   figure: Figure | null;
 }
 
@@ -129,6 +139,7 @@ export interface GeneratedPassage {
   title: string;
   type: string;
   body: string;
+  segments?: PassageSegment[]; // present only when the schema requested it (English passages)
   questions: GeneratedQuestion[];
   figure?: Figure; // present only when the schema requested it (Science passages)
 }
