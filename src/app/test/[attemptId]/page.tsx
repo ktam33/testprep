@@ -108,9 +108,10 @@ export default function TakeTestPage() {
 
       {error && <p className="text-sm text-red-600">{error}</p>}
 
-      {groups.map((group, i) =>
-        group.passage ? (
-          <PassageView key={group.passage.id} passage={group.passage}>
+      {groups.map((group, i) => {
+        const groupFirstNumber = questionNumber + 1;
+        return group.passage ? (
+          <PassageView key={group.passage.id} passage={group.passage} firstQuestionNumber={groupFirstNumber}>
             {group.questions.map((q) => {
               questionNumber += 1;
               return (
@@ -141,8 +142,8 @@ export default function TakeTestPage() {
               );
             })}
           </div>
-        )
-      )}
+        );
+      })}
 
       <div className="fixed inset-x-0 bottom-0 border-t border-gray-200 bg-white/95 backdrop-blur">
         <div className="mx-auto flex max-w-4xl items-center justify-between px-4 py-3">

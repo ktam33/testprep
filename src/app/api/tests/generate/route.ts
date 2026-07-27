@@ -21,6 +21,7 @@ import {
   SECTIONS,
   Figure,
   GeneratedMathTest,
+  GeneratedPassage,
   GeneratedPassageTest,
   GeneratedQuestion,
 } from '@/types';
@@ -28,8 +29,19 @@ import {
 // Science categories that are meaningless without an actual table/graph to look at.
 const DATA_INTERPRETATION_CATEGORIES = new Set(['Tables', 'Graphs', 'Trends & Data Comparison']);
 
-// Generation can now take up to three model calls (generate, one retry, one review pass).
-export const maxDuration = 180;
+// Generation can take up to three model calls (generate, one retry, one review pass).
+export const maxDuration = 300;
+
+// Reasoning effort for the gpt-5.x models. Item-writing is a structured task that does
+// not need deep reasoning, and lower effort is the single biggest per-call latency lever.
+// Override with OPENAI_REASONING_EFFORT if a model/task needs more.
+const REASONING_EFFORT = (process.env.OPENAI_REASONING_EFFORT ?? 'low') as 'low' | 'medium' | 'high';
+
+// Soft wall-clock budget: the optional review pass is skipped (or given a shrunken
+// timeout) once this much of the request has already elapsed, so it can never push the
+// whole request past maxDuration.
+const REVIEW_SOFT_DEADLINE_MS = 150_000;
+const MIN_REVIEW_MS = 25_000;
 
 function tallyCategories(names: string[]): Record<string, number> {
   const tally: Record<string, number> = {};
@@ -66,6 +78,28 @@ Each passage has a "figure" field. For any passage whose questions include Table
 `
       : '';
 
+  const englishGuidance =
+    section === 'english'
+      ? `
+This is the ACT/PreACT English format, NOT a reading-comprehension format. Each passage is written as an ordered "segments" array whose "text" values, concatenated in order, form the full passage. Set "body" to that same full concatenated text as well.
+
+Two kinds of segment:
+- Plain prose: set "questionRef" to -1.
+- An UNDERLINED PORTION governed by a question: set "questionRef" to the 0-based "index" of that question within THIS passage's questions array. Each underlined portion points to exactly one question, and no two point to the same question.
+
+For each passage, make MOST questions (at least 4 of the ${passages[0]?.questionCount ?? 6}) underlined-portion questions, and the rest whole-passage rhetorical questions:
+
+UNDERLINED-PORTION questions (use for Grammar & Usage, Punctuation, and Sentence Structure categories):
+- The underlined segment's "text" is exactly the words the student is evaluating — it lives in the passage and is shown underlined. The question stem is the underline itself, so set that question's "prompt" to "" (empty string), unless the item asks something specific like conciseness or word choice, in which case a short stem such as "Which choice is most concise?" is fine.
+- choices[0] MUST be exactly the string "NO CHANGE". choices[1], choices[2], choices[3] are alternative wordings that would REPLACE the underlined segment's text.
+- Decide deliberately: either the underlined text is already correct (then correctAnswerIndex = 0, "NO CHANGE") OR it contains a genuine error of that question's category. If it contains an error, the error MUST be physically present in the segment's "text" in the passage — never put an error only in a choice or only in the question. The correct choice (1-3) is the properly fixed wording; the other choices are plausible but wrong. About 1/3 to 1/2 of underlined items should be "NO CHANGE"-correct.
+
+WHOLE-PASSAGE / RHETORICAL questions (use for Rhetorical Skills categories — Organization & Paragraph Structure, Main Idea & Supporting Details, Style, Tone & Conciseness, Purpose & Audience): these are NOT tied to a segment (no segment's questionRef points at them). Put the complete question in "prompt" and give 4 normal answer choices (no "NO CHANGE").
+
+Every question's "category" still must match one listed for its passage. Keep the passage coherent, 9th-grade-level prose.
+`
+      : '';
+
   return `Generate a full ${SECTION_LABELS[section]} practice test with exactly ${passages.length} passages and ${totalQuestions} total questions.
 
 ${passageInstructions}
@@ -77,7 +111,7 @@ For every question:
 - correctAnswerIndex is 0-based (0-3).
 - category must exactly match one of the category names listed above for that question's passage.
 - explanation should be 1-2 sentences justifying the correct answer, written for a 9th-grade student.
-${figureGuidance}
+${figureGuidance}${englishGuidance}
 Passage "index" fields must be 0-${passages.length - 1}, in the order listed above.`;
 }
 
@@ -104,7 +138,13 @@ function buildReviewSystemMessage(section: Section): string {
 2. CORRECTNESS — is "correctAnswerIndex" actually the one correct answer, are the other three choices genuinely incorrect with no ties or other defensible answer, and does "explanation" accurately and correctly justify the correct answer?
 
 If a question has any issue, fix it directly by rewriting its prompt, choices, correctAnswerIndex, and/or explanation so it becomes fully correct and well-formed. Keep its category, difficulty, and position (passage index / question index) unchanged — only the content may change. If a question already has no issues, return it completely unchanged. You may also lightly edit a passage's body if needed for one of its questions to make sense, but do not change passage type or ordering.
-
+${
+  section === 'english'
+    ? `
+This English test uses the ACT/PreACT underlined-portion format. Each passage has a "segments" array; segments with questionRef = -1 are plain prose, and a segment whose questionRef is a question's index is that question's UNDERLINED PORTION. For an underlined-portion question, choices[0] is always exactly "NO CHANGE", choices[1-3] are replacement wordings for that segment's text, and correctAnswerIndex = 0 means the underlined text is already correct. When you check such a question, evaluate the actual segment "text" in the passage — any grammatical error being tested must be present in that segment text, not only implied by the choices. If you fix an underlined portion, you may edit the segment's "text" and that question's choices/answer together so they stay consistent, but do NOT change the segments array's length, order, or any questionRef values, and keep body equal to the segment texts concatenated in order. Leave whole-passage rhetorical questions (no segment points to them) in their normal prompt+choices form.
+`
+    : ''
+}
 Return the complete revised test in the exact same JSON structure you were given: the same number of passages in the same order with the same number of questions each (or the same number of standalone questions for Math). Do not add, remove, or reorder anything, and do not add commentary — return only the structured data.`;
 }
 
@@ -117,6 +157,80 @@ function isSection(value: unknown): value is Section {
 }
 
 type ValidationResult = { ok: true } | { ok: false; reason: string };
+
+type PassageExpectation = { index: number; type: string; questionCount: number };
+
+// English question categories that test a specific span of text and therefore MUST be
+// underlined-portion questions tied to a segment. Rhetorical Skills questions may stand alone.
+const ENGLISH_UNDERLINE_CATEGORIES = new Set(
+  categoriesForSection('english')
+    .filter((c) => c.groupName !== 'Rhetorical Skills')
+    .map((c) => c.name)
+);
+
+// Validates a single generated passage against what the skeleton expected of it. Shared by
+// the whole-test validator and the per-passage parallel generation path.
+function validatePassage(section: Section, p: GeneratedPassage, expected: PassageExpectation): ValidationResult {
+  const actual = p.questions?.length ?? 0;
+  if (actual !== expected.questionCount) {
+    return {
+      ok: false,
+      reason: `Passage ${expected.index} ("${expected.type}") should have exactly ${expected.questionCount} questions, got ${actual}. Regenerate with the exact question count.`,
+    };
+  }
+
+  if (section === 'science') {
+    if (p.figure) {
+      const figureCheck = validateFigure(p.figure);
+      if (!figureCheck.ok) return { ok: false, reason: `Passage ${expected.index}: ${figureCheck.reason}` };
+    }
+    const needsFigure = p.questions.some((q) => DATA_INTERPRETATION_CATEGORIES.has(q.category));
+    if (needsFigure && (!p.figure || p.figure.kind === 'none')) {
+      return {
+        ok: false,
+        reason: `Passage ${expected.index} ("${expected.type}") has a Tables/Graphs/Trends & Data Comparison question but figure.kind is "none". Give it a real "table" or chart figure with concrete data.`,
+      };
+    }
+  }
+
+  if (section === 'english') {
+    const segments = p.segments ?? [];
+    if (segments.length === 0) {
+      return { ok: false, reason: `Passage ${expected.index} has no "segments"; write the passage body as an ordered segments array.` };
+    }
+    if (segments.every((s) => !s.text.trim())) {
+      return { ok: false, reason: `Passage ${expected.index} segments contain no text.` };
+    }
+
+    const referenced = new Set<number>();
+    for (const r of segments.map((s) => s.questionRef).filter((r) => r !== -1)) {
+      if (!Number.isInteger(r) || r < 0 || r >= p.questions.length) {
+        return { ok: false, reason: `Passage ${expected.index} has a segment questionRef ${r} that is not a valid question index (0-${p.questions.length - 1}) or -1.` };
+      }
+      if (referenced.has(r)) {
+        return { ok: false, reason: `Passage ${expected.index} has two segments pointing to question ${r}; each underlined portion must reference a distinct question.` };
+      }
+      referenced.add(r);
+    }
+
+    for (let qi = 0; qi < p.questions.length; qi++) {
+      const q = p.questions[qi];
+      const isUnderline = referenced.has(qi);
+      // Grammar/punctuation/sentence-structure items must live in an underlined span (that
+      // is what killed the fabricated-excerpt bug). We deliberately do NOT require
+      // choices[0] to read "NO CHANGE" — that is normalized at persist time — so the model
+      // isn't spuriously rejected for wording the first choice as the original text.
+      if (ENGLISH_UNDERLINE_CATEGORIES.has(q.category) && !isUnderline) {
+        return { ok: false, reason: `Passage ${expected.index} question ${qi} ("${q.category}") must be an underlined-portion question: add a segment whose questionRef is ${qi}.` };
+      }
+      if (!isUnderline && !q.prompt.trim()) {
+        return { ok: false, reason: `Passage ${expected.index} question ${qi} is a whole-passage question, so "prompt" must contain the full question text.` };
+      }
+    }
+  }
+
+  return { ok: true };
+}
 
 function validateGenerated(
   section: Section,
@@ -142,42 +256,19 @@ function validateGenerated(
   const passages = (parsed as GeneratedPassageTest).passages ?? [];
   if (!passageSkeleton) return { ok: false, reason: 'Internal error: missing passage skeleton' };
   if (passages.length !== passageSkeleton.length) {
-    return {
-      ok: false,
-      reason: `Expected exactly ${passageSkeleton.length} passages, got ${passages.length}.`,
-    };
+    return { ok: false, reason: `Expected exactly ${passageSkeleton.length} passages, got ${passages.length}.` };
   }
   for (let i = 0; i < passageSkeleton.length; i++) {
-    const expected = passageSkeleton[i].questionCount;
-    const actual = passages[i]?.questions?.length ?? 0;
-    if (actual !== expected) {
-      return {
-        ok: false,
-        reason: `Passage ${i} ("${passageSkeleton[i].type}") should have exactly ${expected} questions, got ${actual}. Regenerate with the exact counts specified for every passage.`,
-      };
-    }
+    const res = validatePassage(section, passages[i], {
+      index: i,
+      type: passageSkeleton[i].type,
+      questionCount: passageSkeleton[i].questionCount,
+    });
+    if (!res.ok) return res;
   }
   const total = passages.reduce((sum, p) => sum + p.questions.length, 0);
   if (total !== 30) {
     return { ok: false, reason: `Expected 30 total questions across all passages, got ${total}.` };
-  }
-
-  if (section === 'science') {
-    for (const p of passages) {
-      if (p.figure) {
-        const figureCheck = validateFigure(p.figure);
-        if (!figureCheck.ok) {
-          return { ok: false, reason: `Passage ${p.index}: ${figureCheck.reason}` };
-        }
-      }
-      const needsFigure = p.questions.some((q) => DATA_INTERPRETATION_CATEGORIES.has(q.category));
-      if (needsFigure && (!p.figure || p.figure.kind === 'none')) {
-        return {
-          ok: false,
-          reason: `Passage ${p.index} ("${p.type}") has a Tables/Graphs/Trends & Data Comparison question but figure.kind is "none". Give it a real "table" or chart figure with concrete data.`,
-        };
-      }
-    }
   }
 
   return { ok: true };
@@ -210,25 +301,41 @@ function flattenGenerated(
   }
 
   const generated = parsed as GeneratedPassageTest;
-  const passages: PersistPassageInput[] = generated.passages.map((p, i) => ({
-    passageIndex: i,
-    passageType: p.type,
-    title: p.title,
-    body: p.body,
-    figure: collapseFigure(p.figure),
-  }));
+  const passages: PersistPassageInput[] = generated.passages.map((p, i) => {
+    const segments = section === 'english' ? p.segments ?? null : null;
+    // For English, the passage body is the segment runs concatenated in order; fall back
+    // to the model's own body if segments are somehow absent.
+    const body = segments && segments.length > 0 ? segments.map((s) => s.text).join('') : p.body;
+    return {
+      passageIndex: i,
+      passageType: p.type,
+      title: p.title,
+      body,
+      segments,
+      figure: collapseFigure(p.figure),
+    };
+  });
 
   let runningIndex = 0;
   const questions: PersistQuestionInput[] = [];
   generated.passages.forEach((p, passageIdx) => {
-    p.questions.forEach((q: GeneratedQuestion) => {
+    // For English, the underlined-portion questions (those a segment points at) get choice A
+    // normalized to the literal "NO CHANGE" — slot 0 is the "keep the underlined text" option
+    // by construction, so this gives consistent ACT-style display regardless of how the model
+    // worded it, without altering correctAnswerIndex semantics.
+    const underlined =
+      section === 'english'
+        ? new Set((p.segments ?? []).map((s) => s.questionRef).filter((r) => r !== -1))
+        : new Set<number>();
+    p.questions.forEach((q: GeneratedQuestion, qi: number) => {
+      const choices = underlined.has(qi) ? ['NO CHANGE', ...q.choices.slice(1)] : q.choices;
       questions.push({
         questionIndex: runningIndex++,
         passageIndex: passageIdx,
         categoryName: q.category,
         difficulty: q.difficulty,
         prompt: q.prompt,
-        choices: q.choices,
+        choices,
         correctAnswerIndex: q.correctAnswerIndex,
         explanation: q.explanation,
         figure: null, // passage-based questions never carry their own figure — it lives on the passage
@@ -294,76 +401,131 @@ export async function POST(request: NextRequest) {
 
     const schema =
       layout.kind === 'passages'
-        ? buildPassageTestSchema(categoryNames, { passagesHaveFigure: section === 'science' })
+        ? buildPassageTestSchema(categoryNames, {
+            passagesHaveFigure: section === 'science',
+            passagesHaveSegments: section === 'english',
+          })
         : buildMathTestSchema(categoryNames);
 
     const systemMessage = buildSystemMessage(section);
-    const userMessage =
-      layout.kind === 'passages' ? buildPassageUserMessage(section, passageSkeleton!) : buildMathUserMessage(flatList!);
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 90000 });
+    // maxRetries: 0 — the SDK otherwise retries a timed-out call up to twice, which can
+    // silently turn one stall into a multi-minute blow-up of the request budget. We handle
+    // the single meaningful retry (on validation failure) explicitly below.
+    //
+    // timeout is per model call. gpt-5.x reasoning latency for one passage sits near ~85s,
+    // so a 90s cap leaves no margin; since passages are generated in parallel, a higher cap
+    // does not raise wall-clock time — it just keeps a passage near the floor from failing.
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 150000, maxRetries: 0 });
 
-    async function callModel(extraReminder?: string) {
+    async function runCompletion(userContent: string) {
       const completion = await openai.beta.chat.completions.parse({
         model: process.env.OPENAI_MODEL ?? 'gpt-5.1',
+        reasoning_effort: REASONING_EFFORT,
         messages: [
           { role: 'system', content: systemMessage },
-          {
-            role: 'user',
-            content: extraReminder ? `${userMessage}\n\nIMPORTANT CORRECTION: ${extraReminder}` : userMessage,
-          },
+          { role: 'user', content: userContent },
         ],
         response_format: zodResponseFormat(schema, 'preact_test'),
-        temperature: 0.7,
       });
       const parsed = completion.choices[0]?.message?.parsed;
       if (!parsed) throw new Error('No structured output returned from OpenAI');
       return parsed;
     }
 
-    console.log('🔵 [GENERATE API] Calling OpenAI...');
-    let parsed = await callModel();
-    let validation = validateGenerated(section, parsed, passageSkeleton);
+    // Generates one passage (with its questions) in its own call, retrying once on a
+    // validation failure. Passages are produced this way in parallel: a single call for all
+    // five passages exceeds the per-call timeout for English, so splitting into several small
+    // concurrent calls makes total wall time roughly the slowest single passage.
+    async function generateOnePassage(pa: PassageAssignment): Promise<GeneratedPassage> {
+      // Reuse the passage prompt for a single passage rendered at index 0; assembly below
+      // re-derives the real passage index, so the model's own index field is irrelevant.
+      const message = buildPassageUserMessage(section, [{ ...pa, index: 0 }]);
+      const expected: PassageExpectation = { index: pa.index, type: pa.type, questionCount: pa.questionCount };
+      const extract = (p: GeneratedMathTest | GeneratedPassageTest): GeneratedPassage => {
+        const list = (p as GeneratedPassageTest).passages ?? [];
+        if (list.length === 0) throw new Error(`Passage ${pa.index}: model returned no passage`);
+        return list[0] as GeneratedPassage;
+      };
 
-    if (!validation.ok) {
-      console.log('⚠️ [GENERATE API] Validation failed, retrying once:', validation.reason);
-      parsed = await callModel(validation.reason);
-      validation = validateGenerated(section, parsed, passageSkeleton);
+      let passage = extract(await runCompletion(message));
+      let res = validatePassage(section, passage, expected);
+      if (!res.ok) {
+        console.log(`⚠️ [GENERATE API] Passage ${pa.index} validation failed, retrying once:`, res.reason);
+        passage = extract(await runCompletion(`${message}\n\nIMPORTANT CORRECTION: ${res.reason}`));
+        res = validatePassage(section, passage, expected);
+        if (!res.ok) throw new Error(`Passage ${pa.index} failed validation after retry: ${res.reason}`);
+      }
+      return passage;
+    }
+
+    let parsed: GeneratedMathTest | GeneratedPassageTest;
+
+    if (layout.kind === 'passages') {
+      console.log(`🔵 [GENERATE API] Generating ${passageSkeleton!.length} passages in parallel...`);
+      const generatedPassages = await Promise.all(passageSkeleton!.map((pa) => generateOnePassage(pa)));
+      parsed = { passages: generatedPassages };
+      const validation = validateGenerated(section, parsed, passageSkeleton);
+      if (!validation.ok) throw new Error(`Generated test failed validation: ${validation.reason}`);
+    } else {
+      console.log('🔵 [GENERATE API] Calling OpenAI (Math)...');
+      const mathMessage = buildMathUserMessage(flatList!);
+      parsed = await runCompletion(mathMessage);
+      let validation = validateGenerated(section, parsed, passageSkeleton);
       if (!validation.ok) {
-        throw new Error(`Generated test failed validation after retry: ${validation.reason}`);
+        console.log('⚠️ [GENERATE API] Validation failed, retrying once:', validation.reason);
+        parsed = await runCompletion(`${mathMessage}\n\nIMPORTANT CORRECTION: ${validation.reason}`);
+        validation = validateGenerated(section, parsed, passageSkeleton);
+        if (!validation.ok) throw new Error(`Generated test failed validation after retry: ${validation.reason}`);
       }
     }
 
-    console.log('🔵 [GENERATE API] Running evaluation/revision pass...');
-    try {
-      const reviewCompletion = await openai.beta.chat.completions.parse({
-        model: process.env.OPENAI_MODEL ?? 'gpt-5.1',
-        messages: [
-          { role: 'system', content: buildReviewSystemMessage(section) },
-          { role: 'user', content: buildReviewUserMessage(parsed) },
-        ],
-        response_format: zodResponseFormat(schema, 'preact_test_review'),
-        temperature: 0.2,
-      });
-      const reviewed = reviewCompletion.choices[0]?.message?.parsed;
-      if (!reviewed) {
-        console.log('⚠️ [GENERATE API] Evaluation pass returned no output, keeping pre-review test');
-      } else {
-        const reviewValidation = validateGenerated(section, reviewed, passageSkeleton);
-        if (reviewValidation.ok) {
-          parsed = reviewed;
-          console.log('✅ [GENERATE API] Evaluation pass complete (revisions applied where needed)');
+    // The review pass is the third sequential model call and the most expensive (it
+    // re-sends the entire generated test). English is skipped entirely: its underlined
+    // "NO CHANGE" format is already strongly self-validated by validateGenerated, and it
+    // is by far the heaviest/slowest section — the review call is exactly what tips it
+    // over the timeout budget. Other sections keep it, but only if enough wall-clock
+    // budget remains, and with a per-call timeout bounded by that remaining budget.
+    const reviewRemaining = REVIEW_SOFT_DEADLINE_MS - (Date.now() - startTime);
+    if (section === 'english') {
+      console.log('⏭️ [GENERATE API] Skipping evaluation pass for English (self-validated, latency-sensitive)');
+    } else if (reviewRemaining < MIN_REVIEW_MS) {
+      console.log(`⏭️ [GENERATE API] Skipping evaluation pass — only ${reviewRemaining}ms of budget left`);
+    } else {
+      console.log('🔵 [GENERATE API] Running evaluation/revision pass...');
+      try {
+        const reviewCompletion = await openai.beta.chat.completions.parse(
+          {
+            model: process.env.OPENAI_MODEL ?? 'gpt-5.1',
+            reasoning_effort: REASONING_EFFORT,
+            messages: [
+              { role: 'system', content: buildReviewSystemMessage(section) },
+              { role: 'user', content: buildReviewUserMessage(parsed) },
+            ],
+            response_format: zodResponseFormat(schema, 'preact_test_review'),
+          },
+          { timeout: Math.min(reviewRemaining, 90_000) }
+        );
+        const reviewed = reviewCompletion.choices[0]?.message?.parsed;
+        if (!reviewed) {
+          console.log('⚠️ [GENERATE API] Evaluation pass returned no output, keeping pre-review test');
         } else {
-          console.log(
-            '⚠️ [GENERATE API] Evaluation pass broke test structure, keeping pre-review test:',
-            reviewValidation.reason
-          );
+          const reviewValidation = validateGenerated(section, reviewed, passageSkeleton);
+          if (reviewValidation.ok) {
+            parsed = reviewed;
+            console.log('✅ [GENERATE API] Evaluation pass complete (revisions applied where needed)');
+          } else {
+            console.log(
+              '⚠️ [GENERATE API] Evaluation pass broke test structure, keeping pre-review test:',
+              reviewValidation.reason
+            );
+          }
         }
+      } catch (reviewError: any) {
+        // The review pass is a quality enhancement, not a hard requirement — a validated,
+        // pre-review test is still fine to serve if this call fails for any reason.
+        console.log('⚠️ [GENERATE API] Evaluation pass failed, keeping pre-review test:', reviewError.message);
       }
-    } catch (reviewError: any) {
-      // The review pass is a quality enhancement, not a hard requirement — a validated,
-      // pre-review test is still fine to serve if this call fails for any reason.
-      console.log('⚠️ [GENERATE API] Evaluation pass failed, keeping pre-review test:', reviewError.message);
     }
 
     const { passages, questions } = flattenGenerated(section, parsed);

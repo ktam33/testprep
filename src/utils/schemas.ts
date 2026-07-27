@@ -39,9 +39,19 @@ export function buildQuestionSchema(categoryNames: string[], includeFigure: bool
   return includeFigure ? z.object({ ...base, figure: buildFigureSchema() }) : z.object(base);
 }
 
+// One run of an English passage body. questionRef is a 0-based index into this
+// passage's questions array (the question that governs this underlined portion),
+// or -1 for a plain-prose run.
+export function buildSegmentSchema() {
+  return z.object({
+    text: z.string(),
+    questionRef: z.number().int(),
+  });
+}
+
 export function buildPassageTestSchema(
   categoryNames: string[],
-  { passagesHaveFigure }: { passagesHaveFigure: boolean }
+  { passagesHaveFigure, passagesHaveSegments }: { passagesHaveFigure: boolean; passagesHaveSegments: boolean }
 ) {
   const questionSchema = buildQuestionSchema(categoryNames, false);
   const passageBase = {
@@ -51,7 +61,12 @@ export function buildPassageTestSchema(
     body: z.string(),
     questions: z.array(questionSchema),
   };
-  const passageSchema = passagesHaveFigure
+  // English passages carry segments; Science passages carry a figure; these never
+  // co-occur, so a plain ternary keeps each variant's inferred type concrete (a
+  // conditional spread would widen the extra fields to `unknown`).
+  const passageSchema = passagesHaveSegments
+    ? z.object({ ...passageBase, segments: z.array(buildSegmentSchema()) })
+    : passagesHaveFigure
     ? z.object({ ...passageBase, figure: buildFigureSchema() })
     : z.object(passageBase);
 

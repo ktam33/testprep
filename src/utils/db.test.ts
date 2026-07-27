@@ -180,7 +180,7 @@ describe('persistGeneratedTest + getAttemptDetail', () => {
       db,
       user.id,
       'english',
-      [{ passageIndex: 0, passageType: 'English Passage', title: 'T', body: 'Body text.', figure: null }],
+      [{ passageIndex: 0, passageType: 'English Passage', title: 'T', body: 'Body text.', segments: null, figure: null }],
       [
         {
           questionIndex: 0,
@@ -246,7 +246,7 @@ describe('figure persistence', () => {
       db,
       user.id,
       'science',
-      [{ passageIndex: 0, passageType: 'Data Representation A', title: 'T', body: 'Body', figure: tableFigure }],
+      [{ passageIndex: 0, passageType: 'Data Representation A', title: 'T', body: 'Body', segments: null, figure: tableFigure }],
       [
         {
           questionIndex: 0,
@@ -322,6 +322,44 @@ describe('figure persistence', () => {
     const detail = getAttemptDetail(db, attemptId, { includeAnswers: true })!;
     expect(detail.questions[0].figure).toBeNull();
   });
+
+  it('round-trips English passage segments and leaves them null for other sections', () => {
+    const user = createUser(db, 'Alice');
+    const [englishCat] = categoryIdsFor('english');
+    const segments = [
+      { text: 'The team ', questionRef: -1 },
+      { text: 'were winning', questionRef: 0 },
+      { text: ' the game.', questionRef: -1 },
+    ];
+
+    const attemptId = persistGeneratedTest(
+      db,
+      user.id,
+      'english',
+      [{ passageIndex: 0, passageType: 'English Passage', title: 'T', body: 'The team were winning the game.', segments, figure: null }],
+      [
+        {
+          questionIndex: 0,
+          passageIndex: 0,
+          categoryName: englishCat.name,
+          difficulty: 'easy',
+          prompt: '',
+          choices: ['NO CHANGE', 'was winning', 'is winning', 'be winning'],
+          correctAnswerIndex: 1,
+          explanation: 'x',
+          figure: null,
+        },
+      ]
+    );
+
+    const detail = getAttemptDetail(db, attemptId, { includeAnswers: true })!;
+    expect(detail.passages[0].segments).toEqual(segments);
+
+    const raw = db.prepare('SELECT segments FROM passages WHERE test_attempt_id = ?').get(attemptId) as {
+      segments: string | null;
+    };
+    expect(typeof raw.segments).toBe('string'); // stored as JSON
+  });
 });
 
 describe('submitAttempt + getProgressSummary', () => {
@@ -333,7 +371,7 @@ describe('submitAttempt + getProgressSummary', () => {
       db,
       user.id,
       'reading',
-      [{ passageIndex: 0, passageType: 'Literary Narrative', title: 'T', body: 'Body', figure: null }],
+      [{ passageIndex: 0, passageType: 'Literary Narrative', title: 'T', body: 'Body', segments: null, figure: null }],
       [
         {
           questionIndex: 0,

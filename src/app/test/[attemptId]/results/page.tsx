@@ -90,9 +90,10 @@ export default function ResultsPage() {
 
       <h2 className="text-lg font-semibold text-gray-900">Review</h2>
 
-      {groups.map((group, i) =>
-        group.passage ? (
-          <PassageView key={group.passage.id} passage={group.passage}>
+      {groups.map((group, i) => {
+        const groupFirstNumber = questionNumber + 1;
+        return group.passage ? (
+          <PassageView key={group.passage.id} passage={group.passage} firstQuestionNumber={groupFirstNumber}>
             {group.questions.map((q) => {
               questionNumber += 1;
               return (
@@ -121,8 +122,8 @@ export default function ResultsPage() {
               );
             })}
           </div>
-        )
-      )}
+        );
+      })}
 
       <div className="flex justify-center gap-4 pb-8">
         <Link href={`/sections/${attempt.section}`} className="text-sm text-blue-600 hover:underline">
