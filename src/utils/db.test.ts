@@ -2,12 +2,16 @@ import Database from 'better-sqlite3';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { Figure } from '@/types';
 import {
+  claimPregeneratedTest,
+  countAvailablePregen,
   createDb,
   createUser,
   getAttemptCategoryBreakdown,
   getAttemptDetail,
   getCategoryStats,
+  getColdStartCategoryStats,
   getProgressSummary,
+  insertPregeneratedTest,
   listAttempts,
   listUsers,
   persistGeneratedTest,
@@ -425,5 +429,72 @@ describe('submitAttempt + getProgressSummary', () => {
     expect(readingSummary.attemptCount).toBe(1);
     expect(readingSummary.averageScore).toBe(0.5);
     expect(readingSummary.weakestCategory).toBe(cat2.name);
+  });
+});
+
+describe('pre-generation pool', () => {
+  // A minimal one-question math test payload, shaped like GeneratedTestContent.
+  function mathContent() {
+    const [cat] = categoryIdsFor('math');
+    return {
+      passages: [],
+      questions: [
+        {
+          questionIndex: 0,
+          passageIndex: null,
+          categoryName: cat.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: null,
+        },
+      ],
+    };
+  }
+
+  it('getColdStartCategoryStats returns every category at zero', () => {
+    const stats = getColdStartCategoryStats(db, 'english');
+    expect(stats).toHaveLength(16);
+    expect(stats.every((s) => s.attempts === 0 && s.correct === 0)).toBe(true);
+  });
+
+  it('counts available pool tests per section', () => {
+    insertPregeneratedTest(db, 'math', JSON.stringify(mathContent()));
+    insertPregeneratedTest(db, 'math', JSON.stringify(mathContent()));
+    insertPregeneratedTest(db, 'english', JSON.stringify(mathContent()));
+
+    const counts = countAvailablePregen(db);
+    expect(counts.math).toBe(2);
+    expect(counts.english).toBe(1);
+    expect(counts.reading).toBe(0);
+    expect(counts.science).toBe(0);
+  });
+
+  it('claiming does not consume, but submitting the derived attempt does', () => {
+    const user = createUser(db, 'Alice');
+    insertPregeneratedTest(db, 'math', JSON.stringify(mathContent()));
+
+    // Claim: the pool test is returned but stays available (unsubmitted = reusable).
+    const claimed = claimPregeneratedTest(db, 'math')!;
+    expect(claimed).not.toBeNull();
+    expect(countAvailablePregen(db).math).toBe(1);
+
+    // Deriving an attempt from it (still not submitted) leaves it available.
+    const content = JSON.parse(claimed.content);
+    const attemptId = persistGeneratedTest(db, user.id, 'math', content.passages, content.questions, claimed.id);
+    expect(countAvailablePregen(db).math).toBe(1);
+    expect(claimPregeneratedTest(db, 'math')!.id).toBe(claimed.id); // still claimable
+
+    // Submitting the attempt consumes the source pool test for good.
+    const q = getAttemptDetail(db, attemptId, { includeAnswers: true })!.questions[0];
+    submitAttempt(db, attemptId, [{ questionId: q.id, selectedAnswerIndex: 0 }]);
+    expect(countAvailablePregen(db).math).toBe(0);
+    expect(claimPregeneratedTest(db, 'math')).toBeNull();
+  });
+
+  it('returns null when the pool for a section is empty', () => {
+    expect(claimPregeneratedTest(db, 'science')).toBeNull();
   });
 });
