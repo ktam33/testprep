@@ -1,24 +1,34 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { Section, SECTION_LABELS, SECTIONS } from '@/types';
+import { getCurrentUser } from '@/utils/session';
 import LoadingSpinner from '@/components/LoadingSpinner';
 
 interface PregenStatus {
   target: number;
   available: Record<Section, number>;
-  generating: Section | null;
+  generatingSection: Section | null;
   lastError: string | null;
   lastErrorAt: string | null;
 }
 
 export default function AdminPage() {
+  const router = useRouter();
+  const [userName, setUserName] = useState<string | null>(null);
   const [status, setStatus] = useState<PregenStatus | null>(null);
   const [error, setError] = useState('');
 
   const load = useCallback(async () => {
+    const user = getCurrentUser();
+    if (!user) {
+      router.replace('/');
+      return;
+    }
+    setUserName(user.name);
     try {
-      const res = await fetch('/api/admin/pregen-status', { cache: 'no-store' });
+      const res = await fetch(`/api/admin/pregen-status?userId=${user.id}`, { cache: 'no-store' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to load status');
       setStatus(data);
@@ -26,7 +36,7 @@ export default function AdminPage() {
     } catch (err: any) {
       setError(err.message);
     }
-  }, []);
+  }, [router]);
 
   useEffect(() => {
     load();
@@ -53,20 +63,21 @@ export default function AdminPage() {
       </div>
 
       <p className="text-sm text-gray-500">
-        The background worker keeps up to {status.target} ready-to-use tests per subject ({totalAvailable}/{totalTarget}{' '}
-        available). Starting a test uses a pool test instantly when one exists; otherwise it is generated on demand.
+        Adaptive tests kept ready for <strong className="text-gray-700">{userName}</strong> — up to {status.target} per
+        subject ({totalAvailable}/{totalTarget} available). Starting a test uses a ready one instantly when it exists;
+        otherwise it is generated on demand.
       </p>
 
-      {status.generating ? (
+      {status.generatingSection ? (
         <div className="flex items-center gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3">
           <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-blue-500" />
           <p className="text-sm text-blue-800">
-            Currently generating a <strong>{SECTION_LABELS[status.generating]}</strong> test…
+            Currently generating a <strong>{SECTION_LABELS[status.generatingSection]}</strong> test…
           </p>
         </div>
       ) : (
         <div className="rounded-xl border border-gray-200 bg-gray-50 px-4 py-3">
-          <p className="text-sm text-gray-600">No test is currently being generated.</p>
+          <p className="text-sm text-gray-600">No test is currently being generated for this profile.</p>
         </div>
       )}
 
@@ -82,7 +93,7 @@ export default function AdminPage() {
           <tbody className="divide-y divide-gray-100">
             {SECTIONS.map((s) => {
               const available = status.available[s] ?? 0;
-              const isGenerating = status.generating === s;
+              const isGenerating = status.generatingSection === s;
               const full = available >= status.target;
               return (
                 <tr key={s}>

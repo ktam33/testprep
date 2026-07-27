@@ -9,7 +9,6 @@ import {
   getAttemptCategoryBreakdown,
   getAttemptDetail,
   getCategoryStats,
-  getColdStartCategoryStats,
   getProgressSummary,
   insertPregeneratedTest,
   listAttempts,
@@ -454,47 +453,48 @@ describe('pre-generation pool', () => {
     };
   }
 
-  it('getColdStartCategoryStats returns every category at zero', () => {
-    const stats = getColdStartCategoryStats(db, 'english');
-    expect(stats).toHaveLength(16);
-    expect(stats.every((s) => s.attempts === 0 && s.correct === 0)).toBe(true);
-  });
+  it('counts a user\'s available pool tests per section, isolated between users', () => {
+    const alice = createUser(db, 'Alice');
+    const bob = createUser(db, 'Bob');
+    insertPregeneratedTest(db, alice.id, 'math', JSON.stringify(mathContent()));
+    insertPregeneratedTest(db, alice.id, 'math', JSON.stringify(mathContent()));
+    insertPregeneratedTest(db, alice.id, 'english', JSON.stringify(mathContent()));
+    insertPregeneratedTest(db, bob.id, 'science', JSON.stringify(mathContent()));
 
-  it('counts available pool tests per section', () => {
-    insertPregeneratedTest(db, 'math', JSON.stringify(mathContent()));
-    insertPregeneratedTest(db, 'math', JSON.stringify(mathContent()));
-    insertPregeneratedTest(db, 'english', JSON.stringify(mathContent()));
+    const aliceCounts = countAvailablePregen(db, alice.id);
+    expect(aliceCounts.math).toBe(2);
+    expect(aliceCounts.english).toBe(1);
+    expect(aliceCounts.science).toBe(0);
 
-    const counts = countAvailablePregen(db);
-    expect(counts.math).toBe(2);
-    expect(counts.english).toBe(1);
-    expect(counts.reading).toBe(0);
-    expect(counts.science).toBe(0);
+    const bobCounts = countAvailablePregen(db, bob.id);
+    expect(bobCounts.math).toBe(0);
+    expect(bobCounts.science).toBe(1);
   });
 
   it('claiming does not consume, but submitting the derived attempt does', () => {
     const user = createUser(db, 'Alice');
-    insertPregeneratedTest(db, 'math', JSON.stringify(mathContent()));
+    insertPregeneratedTest(db, user.id, 'math', JSON.stringify(mathContent()));
 
     // Claim: the pool test is returned but stays available (unsubmitted = reusable).
-    const claimed = claimPregeneratedTest(db, 'math')!;
+    const claimed = claimPregeneratedTest(db, user.id, 'math')!;
     expect(claimed).not.toBeNull();
-    expect(countAvailablePregen(db).math).toBe(1);
+    expect(countAvailablePregen(db, user.id).math).toBe(1);
 
     // Deriving an attempt from it (still not submitted) leaves it available.
     const content = JSON.parse(claimed.content);
     const attemptId = persistGeneratedTest(db, user.id, 'math', content.passages, content.questions, claimed.id);
-    expect(countAvailablePregen(db).math).toBe(1);
-    expect(claimPregeneratedTest(db, 'math')!.id).toBe(claimed.id); // still claimable
+    expect(countAvailablePregen(db, user.id).math).toBe(1);
+    expect(claimPregeneratedTest(db, user.id, 'math')!.id).toBe(claimed.id); // still claimable
 
     // Submitting the attempt consumes the source pool test for good.
     const q = getAttemptDetail(db, attemptId, { includeAnswers: true })!.questions[0];
     submitAttempt(db, attemptId, [{ questionId: q.id, selectedAnswerIndex: 0 }]);
-    expect(countAvailablePregen(db).math).toBe(0);
-    expect(claimPregeneratedTest(db, 'math')).toBeNull();
+    expect(countAvailablePregen(db, user.id).math).toBe(0);
+    expect(claimPregeneratedTest(db, user.id, 'math')).toBeNull();
   });
 
-  it('returns null when the pool for a section is empty', () => {
-    expect(claimPregeneratedTest(db, 'science')).toBeNull();
+  it('returns null when the pool for a user+section is empty', () => {
+    const user = createUser(db, 'Alice');
+    expect(claimPregeneratedTest(db, user.id, 'science')).toBeNull();
   });
 });

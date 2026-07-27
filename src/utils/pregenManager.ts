@@ -1,16 +1,21 @@
-import { getDb, countAvailablePregen, insertPregeneratedTest, getColdStartCategoryStats } from '@/utils/db';
+import { getDb, countAvailablePregen, insertPregeneratedTest, getCategoryStats, listUsers } from '@/utils/db';
 import { generateTest } from '@/utils/testGenerator';
 import { Section, SECTIONS } from '@/types';
 
-// Target number of ready-to-use pool tests to keep on hand per section.
+// Target number of ready-to-use pool tests to keep on hand per user, per section.
 export const PREGEN_TARGET_PER_SECTION = 2;
 
 // Stop the fill loop after this many generations fail back-to-back, so a persistent
 // failure (bad API key, model outage) can't spin forever.
 const MAX_CONSECUTIVE_FAILURES = 3;
 
+interface GeneratingRef {
+  userId: number;
+  section: Section;
+}
+
 interface PregenState {
-  generating: Section | null; // the section currently being generated, if any
+  generating: GeneratingRef | null; // the (user, section) currently being generated, if any
   looping: boolean; // whether the fill loop is active (single-flight guard)
   lastError: string | null;
   lastErrorAt: string | null;
@@ -27,30 +32,39 @@ const state: PregenState =
 export interface PregenStatus {
   target: number;
   available: Record<Section, number>;
-  generating: Section | null;
+  generatingSection: Section | null; // the section being generated FOR THIS USER, if any
   lastError: string | null;
   lastErrorAt: string | null;
 }
 
-export function getPregenStatus(): PregenStatus {
+// Status scoped to a single user: their available counts, and whether the worker is
+// currently generating for them specifically.
+export function getPregenStatus(userId: number): PregenStatus {
   return {
     target: PREGEN_TARGET_PER_SECTION,
-    available: countAvailablePregen(getDb()),
-    generating: state.generating,
+    available: countAvailablePregen(getDb(), userId),
+    generatingSection: state.generating?.userId === userId ? state.generating.section : null,
     lastError: state.lastError,
     lastErrorAt: state.lastErrorAt,
   };
 }
 
-function sectionsBelowTarget(): Section[] {
-  const counts = countAvailablePregen(getDb());
-  return SECTIONS.filter((s) => (counts[s] ?? 0) < PREGEN_TARGET_PER_SECTION);
+// The next (user, section) slot anywhere that is below target, or null if all pools are full.
+function nextSlotToFill(): GeneratingRef | null {
+  const db = getDb();
+  for (const user of listUsers(db)) {
+    const counts = countAvailablePregen(db, user.id);
+    const section = SECTIONS.find((s) => (counts[s] ?? 0) < PREGEN_TARGET_PER_SECTION);
+    if (section) return { userId: user.id, section };
+  }
+  return null;
 }
 
 /**
- * Fire-and-forget: ensure every section has PREGEN_TARGET_PER_SECTION available pool tests,
- * generating them one at a time. Safe to call often — if the fill loop is already running,
- * or there is no API key, it returns immediately. Never throws (background use).
+ * Fire-and-forget: ensure every user has PREGEN_TARGET_PER_SECTION available pool tests per
+ * section, generating them one at a time using each user's own adaptive category stats.
+ * Safe to call often — if the fill loop is already running, or there is no API key, it
+ * returns immediately. Never throws (background use).
  */
 export async function triggerPregeneration(): Promise<void> {
   if (state.looping) return;
@@ -59,22 +73,23 @@ export async function triggerPregeneration(): Promise<void> {
   state.looping = true;
   let consecutiveFailures = 0;
   try {
-    while (sectionsBelowTarget().length > 0) {
-      // Recompute each iteration: submits/claims change the counts underneath us.
-      const section = sectionsBelowTarget()[0];
-      state.generating = section;
+    let slot = nextSlotToFill();
+    while (slot) {
+      state.generating = slot;
       try {
         const db = getDb();
-        const content = await generateTest(section, getColdStartCategoryStats(db, section));
-        insertPregeneratedTest(db, section, JSON.stringify(content));
+        // Adaptive: weight the pool test by this user's real performance history.
+        const stats = getCategoryStats(db, slot.userId, slot.section);
+        const content = await generateTest(slot.section, stats);
+        insertPregeneratedTest(db, slot.userId, slot.section, JSON.stringify(content));
         state.lastError = null;
         consecutiveFailures = 0;
-        console.log(`✅ [PREGEN] Stored a pre-generated ${section} test`);
+        console.log(`✅ [PREGEN] Stored a ${slot.section} test for user ${slot.userId}`);
       } catch (err: any) {
         state.lastError = err?.message ?? String(err);
         state.lastErrorAt = new Date().toISOString();
         consecutiveFailures += 1;
-        console.log(`⚠️ [PREGEN] Failed to generate ${section}: ${state.lastError}`);
+        console.log(`⚠️ [PREGEN] Failed to generate ${slot.section} for user ${slot.userId}: ${state.lastError}`);
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
           console.log('⚠️ [PREGEN] Too many consecutive failures — pausing the fill loop');
           break;
@@ -82,6 +97,7 @@ export async function triggerPregeneration(): Promise<void> {
       } finally {
         state.generating = null;
       }
+      slot = nextSlotToFill();
     }
   } finally {
     state.looping = false;

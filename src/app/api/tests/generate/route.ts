@@ -27,10 +27,10 @@ export async function POST(request: NextRequest) {
 
     const db = getDb();
 
-    // 1. If a pre-generated test is waiting in the pool, hand it out immediately. It stays
-    //    in the pool (still "available") until this attempt is submitted, so abandoning it
-    //    leaves it reusable.
-    const pregen = claimPregeneratedTest(db, section);
+    // 1. If a pre-generated test is waiting in this user's pool, hand it out immediately. It
+    //    stays in the pool (still "available") until this attempt is submitted, so abandoning
+    //    it leaves it reusable.
+    const pregen = claimPregeneratedTest(db, userId, section);
     if (pregen) {
       const content = JSON.parse(pregen.content) as GeneratedTestContent;
       const attemptId = persistGeneratedTest(db, userId, section, content.passages, content.questions, pregen.id);
