@@ -1,5 +1,6 @@
 import { Question } from '@/types';
 import FigureView from './FigureView';
+import MathText from './MathText';
 
 interface QuestionCardProps {
   question: Question;
@@ -19,7 +20,7 @@ export default function QuestionCard({
   return (
     <div className="border-t border-gray-100 pt-4 first:border-0 first:pt-0">
       <p className="mb-3 font-medium text-gray-900">
-        {questionNumber}.{question.prompt ? ` ${question.prompt}` : ''}
+        {questionNumber}.{question.prompt ? <> <MathText>{question.prompt}</MathText></> : ''}
       </p>
       <FigureView figure={question.figure} />
       <div className="space-y-2">
@@ -42,7 +43,7 @@ export default function QuestionCard({
           return (
             <button key={i} type="button" disabled={mode === 'review'} onClick={() => onSelect?.(i)} className={classes}>
               <span className="font-semibold text-gray-500">{String.fromCharCode(65 + i)}.</span>
-              <span className="text-gray-800">{choice}</span>
+              <MathText className="text-gray-800">{choice}</MathText>
             </button>
           );
         })}
@@ -50,7 +51,7 @@ export default function QuestionCard({
       {mode === 'review' && question.explanation && (
         <p className="mt-3 rounded-lg bg-gray-50 px-3 py-2 text-sm text-gray-600">
           <strong className="text-gray-800">Explanation: </strong>
-          {question.explanation}
+          <MathText>{question.explanation}</MathText>
         </p>
       )}
     </div>

@@ -128,6 +128,7 @@ For every question:
 - category must exactly match one of the category names listed above.
 - explanation should be 1-2 sentences justifying the correct answer, written for a 9th-grade student.
 - index is the question's 0-based position in the overall 30-question test (0-29).
+- Write every mathematical expression as LaTeX wrapped in \\( ... \\) delimiters — in the prompt, in EACH of the four answer choices, and in the explanation. For example an answer choice must be "\\(\\dfrac{11}{12}\\)", never a bare "\\dfrac{11}{12}" or "11/12". Plain non-mathematical words stay outside the delimiters.
 - Every question has a "figure" field. For Statistics & Probability, Coordinate Plane & Graphing, and Slope & Linear Relationships questions, often (not always) give it a real table (kind: "table") or chart (kind: "bar"/"line"/"scatter", with concrete x/y points, roughly 4-8 points for legibility) that the question actually depends on. For all other questions, and for any of those categories where a figure isn't a natural fit, set "figure" to exactly { "kind": "none", "title": "", "xLabel": "", "yLabel": "", "columns": [], "rows": [], "series": [] }.`;
 }
 
