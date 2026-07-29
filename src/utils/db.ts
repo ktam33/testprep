@@ -20,6 +20,21 @@ import {
   SECTIONS,
 } from '@/types';
 
+// Shared by the CREATE TABLE below and by repairPregeneratedTests(), which rebuilds the
+// table on databases where user_id arrived as a plain ALTER TABLE column. Keeping one
+// definition means the rebuilt table can never drift from the declared schema.
+const PREGENERATED_TESTS_COLUMNS = `
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  section     TEXT NOT NULL CHECK (section IN ('english','math','reading','science')),
+  content     TEXT NOT NULL,
+  consumed    INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1)),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+`;
+
+const PREGENERATED_AVAIL_INDEX = 'idx_pregenerated_avail';
+const PREGENERATED_AVAIL_INDEX_DDL = `CREATE INDEX IF NOT EXISTS ${PREGENERATED_AVAIL_INDEX} ON pregenerated_tests(user_id, section, consumed)`;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,20 +100,13 @@ CREATE TABLE IF NOT EXISTS responses (
 -- generator. "content" is the JSON { passages, questions } persist payload. A pool test
 -- stays "available" (consumed = 0) until an attempt derived from it is actually submitted,
 -- so an unsubmitted (abandoned) attempt leaves its source test reusable.
-CREATE TABLE IF NOT EXISTS pregenerated_tests (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  section     TEXT NOT NULL CHECK (section IN ('english','math','reading','science')),
-  content     TEXT NOT NULL,
-  consumed    INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1)),
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
+CREATE TABLE IF NOT EXISTS pregenerated_tests (${PREGENERATED_TESTS_COLUMNS});
 
 CREATE INDEX IF NOT EXISTS idx_test_attempts_user  ON test_attempts(user_id);
 CREATE INDEX IF NOT EXISTS idx_questions_attempt   ON questions(test_attempt_id);
 CREATE INDEX IF NOT EXISTS idx_questions_category  ON questions(category_id);
 CREATE INDEX IF NOT EXISTS idx_passages_attempt    ON passages(test_attempt_id);
-CREATE INDEX IF NOT EXISTS idx_pregenerated_avail  ON pregenerated_tests(user_id, section, consumed);
+${PREGENERATED_AVAIL_INDEX_DDL};
 `;
 
 function defaultDbPath(): string {
@@ -112,6 +120,72 @@ function ensureColumn(db: Database.Database, table: string, column: string, ddlT
   if (!cols.some((c) => c.name === column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddlType}`);
     console.log(`🟢 [DB] Migrated: added ${table}.${column}`);
+  }
+}
+
+/**
+ * Repairs `pregenerated_tests` on databases that predate the per-user pool.
+ *
+ * On those, `user_id` was introduced with `ALTER TABLE ADD COLUMN`, and SQLite cannot
+ * attach a foreign key (or NOT NULL) that way — so the column ended up plain and nullable
+ * and deleting a user orphaned their pool rows instead of cascading. A table rebuild is
+ * the only way to add the constraint, so do exactly that, once, when the FK is missing.
+ *
+ * Also re-cuts the availability index: it predates user_id, and `CREATE INDEX IF NOT
+ * EXISTS` matched on name alone, so it silently stayed on the old (section, consumed)
+ * columns while every pool query filters on user_id first.
+ */
+function repairPregeneratedTests(db: Database.Database) {
+  const fks = db.prepare('PRAGMA foreign_key_list(pregenerated_tests)').all() as { from: string }[];
+
+  if (!fks.some((f) => f.from === 'user_id')) {
+    // Rows with no owner cannot satisfy the new NOT NULL/FK. They are unreachable anyway:
+    // every pool query is scoped by user_id.
+    const orphans = db
+      .prepare('SELECT COUNT(*) AS n FROM pregenerated_tests WHERE user_id IS NULL OR user_id NOT IN (SELECT id FROM users)')
+      .get() as { n: number };
+
+    // Foreign keys must be off for the drop-and-rename, and the pragma is a no-op inside a
+    // transaction — so it has to be toggled around the whole rebuild.
+    const fkWasOn = (db.pragma('foreign_keys', { simple: true }) as number) === 1;
+    db.pragma('foreign_keys = OFF');
+    try {
+      db.transaction(() => {
+        db.exec(`CREATE TABLE pregenerated_tests_rebuilt (${PREGENERATED_TESTS_COLUMNS})`);
+        db.exec(
+          `INSERT INTO pregenerated_tests_rebuilt (id, user_id, section, content, consumed, created_at)
+           SELECT id, user_id, section, content, consumed, created_at
+           FROM pregenerated_tests
+           WHERE user_id IS NOT NULL AND user_id IN (SELECT id FROM users)`
+        );
+        db.exec('DROP TABLE pregenerated_tests'); // takes its stale index with it
+        db.exec('ALTER TABLE pregenerated_tests_rebuilt RENAME TO pregenerated_tests');
+        db.exec(PREGENERATED_AVAIL_INDEX_DDL);
+      })();
+
+      const violations = db.prepare('PRAGMA foreign_key_check(pregenerated_tests)').all();
+      if (violations.length > 0) {
+        throw new Error(`pregenerated_tests rebuild left ${violations.length} FK violation(s)`);
+      }
+    } finally {
+      if (fkWasOn) db.pragma('foreign_keys = ON');
+    }
+
+    console.log(
+      `🟢 [DB] Migrated: rebuilt pregenerated_tests with the users(id) cascade` +
+        (orphans.n > 0 ? ` (dropped ${orphans.n} ownerless row(s))` : '')
+    );
+    return;
+  }
+
+  // FK already correct, but the index may still be the pre-user_id one.
+  const index = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name = ?`)
+    .get(PREGENERATED_AVAIL_INDEX) as { sql: string | null } | undefined;
+  if (index?.sql && !index.sql.includes('user_id')) {
+    db.exec(`DROP INDEX ${PREGENERATED_AVAIL_INDEX}`);
+    db.exec(PREGENERATED_AVAIL_INDEX_DDL);
+    console.log(`🟢 [DB] Migrated: re-cut ${PREGENERATED_AVAIL_INDEX} on (user_id, section, consumed)`);
   }
 }
 
@@ -143,9 +217,11 @@ export function createDb(filePath: string = defaultDbPath()): Database.Database 
   // Links an attempt back to the pool test it came from, so submitting the attempt can
   // mark that pool test consumed. Null for on-demand (non-pool) attempts.
   ensureColumn(db, 'test_attempts', 'pregenerated_id', 'INTEGER');
-  // Pools became per-user; drop any legacy user-agnostic pool rows from before the migration.
+  // Pools became per-user. ensureColumn gets the column onto legacy databases, but only a
+  // table rebuild can give it the NOT NULL + cascade the schema declares; that (and
+  // dropping the legacy ownerless rows) is repairPregeneratedTests' job.
   ensureColumn(db, 'pregenerated_tests', 'user_id', 'INTEGER');
-  db.exec('DELETE FROM pregenerated_tests WHERE user_id IS NULL');
+  repairPregeneratedTests(db);
   seedCategories(db);
   return db;
 }
