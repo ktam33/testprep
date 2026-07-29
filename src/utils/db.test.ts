@@ -4,10 +4,12 @@ import { Figure } from '@/types';
 import {
   createDb,
   createUser,
+  deleteAttempt,
   getAttemptCategoryBreakdown,
   getAttemptDetail,
   getCategoryStats,
   getProgressSummary,
+  getTestAttempt,
   listAttempts,
   listUsers,
   persistGeneratedTest,
@@ -425,5 +427,150 @@ describe('submitAttempt + getProgressSummary', () => {
     expect(readingSummary.attemptCount).toBe(1);
     expect(readingSummary.averageScore).toBe(0.5);
     expect(readingSummary.weakestCategory).toBe(cat2.name);
+  });
+});
+
+describe('deleteAttempt', () => {
+  function seedGradedMathAttempt(userId: number, categoryName: string, allCorrect: boolean) {
+    const attemptId = persistGeneratedTest(
+      db,
+      userId,
+      'math',
+      [],
+      [0, 1].map((i) => ({
+        questionIndex: i,
+        passageIndex: null,
+        categoryName,
+        difficulty: 'easy' as const,
+        prompt: `Q${i}`,
+        choices: ['a', 'b', 'c', 'd'],
+        correctAnswerIndex: 0,
+        explanation: 'x',
+        figure: null,
+      }))
+    );
+    const detail = getAttemptDetail(db, attemptId, { includeAnswers: true })!;
+    submitAttempt(
+      db,
+      attemptId,
+      detail.questions.map((q) => ({ questionId: q.id, selectedAnswerIndex: allCorrect ? 0 : 3 }))
+    );
+    return attemptId;
+  }
+
+  it('removes the attempt and its questions, passages and responses', () => {
+    const user = createUser(db, 'Alice');
+    const [cat1] = categoryIdsFor('math');
+    const attemptId = seedGradedMathAttempt(user.id, cat1.name, true);
+
+    expect(deleteAttempt(db, attemptId, user.id)).toBe(true);
+    expect(getTestAttempt(db, attemptId)).toBeUndefined();
+
+    const orphanQuestions = db
+      .prepare('SELECT COUNT(*) AS n FROM questions WHERE test_attempt_id = ?')
+      .get(attemptId) as { n: number };
+    const orphanResponses = db
+      .prepare('SELECT COUNT(*) AS n FROM responses WHERE question_id NOT IN (SELECT id FROM questions)')
+      .get() as { n: number };
+    expect(orphanQuestions.n).toBe(0);
+    expect(orphanResponses.n).toBe(0);
+  });
+
+  it('excludes the deleted attempt from category stats and the dashboard summary', () => {
+    const user = createUser(db, 'Alice');
+    const [cat1] = categoryIdsFor('math');
+    const keptId = seedGradedMathAttempt(user.id, cat1.name, true);
+    const deletedId = seedGradedMathAttempt(user.id, cat1.name, false);
+
+    const before = getCategoryStats(db, user.id, 'math').find((s) => s.categoryId === cat1.id)!;
+    expect(before.attempts).toBe(4);
+    expect(before.correct).toBe(2);
+    expect(getProgressSummary(db, user.id).find((s) => s.section === 'math')!.averageScore).toBe(0.5);
+
+    deleteAttempt(db, deletedId, user.id);
+
+    // Stats now reflect only the kept attempt — the same numbers allocateQuestions()
+    // reads when weighting the next generated test.
+    const after = getCategoryStats(db, user.id, 'math').find((s) => s.categoryId === cat1.id)!;
+    expect(after.attempts).toBe(2);
+    expect(after.correct).toBe(2);
+
+    const mathSummary = getProgressSummary(db, user.id).find((s) => s.section === 'math')!;
+    expect(mathSummary.attemptCount).toBe(1);
+    expect(mathSummary.averageScore).toBe(1);
+    expect(listAttempts(db, user.id, 'math').map((a) => a.id)).toEqual([keptId]);
+  });
+
+  it('refuses to delete another user’s attempt', () => {
+    const alice = createUser(db, 'Alice');
+    const bob = createUser(db, 'Bob');
+    const [cat1] = categoryIdsFor('math');
+    const attemptId = seedGradedMathAttempt(alice.id, cat1.name, true);
+
+    expect(deleteAttempt(db, attemptId, bob.id)).toBe(false);
+    expect(getTestAttempt(db, attemptId)).toBeDefined();
+    expect(getCategoryStats(db, alice.id, 'math').find((s) => s.categoryId === cat1.id)!.attempts).toBe(2);
+  });
+
+  it('returns false for an unknown attempt id', () => {
+    const user = createUser(db, 'Alice');
+    expect(deleteAttempt(db, 9999, user.id)).toBe(false);
+  });
+
+  it('cascades to the passages of a passage-based section', () => {
+    const user = createUser(db, 'Alice');
+    const [cat1] = categoryIdsFor('reading');
+    const attemptId = persistGeneratedTest(
+      db,
+      user.id,
+      'reading',
+      [{ passageIndex: 0, passageType: 'Literary Narrative', title: 'T', body: 'Body', segments: null, figure: null }],
+      [
+        {
+          questionIndex: 0,
+          passageIndex: 0,
+          categoryName: cat1.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: null,
+        },
+      ]
+    );
+
+    expect(deleteAttempt(db, attemptId, user.id)).toBe(true);
+    const passages = db
+      .prepare('SELECT COUNT(*) AS n FROM passages WHERE test_attempt_id = ?')
+      .get(attemptId) as { n: number };
+    expect(passages.n).toBe(0);
+  });
+
+  it('deletes an in-progress attempt that was never graded', () => {
+    const user = createUser(db, 'Alice');
+    const [cat1] = categoryIdsFor('math');
+    const attemptId = persistGeneratedTest(
+      db,
+      user.id,
+      'math',
+      [],
+      [
+        {
+          questionIndex: 0,
+          passageIndex: null,
+          categoryName: cat1.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: null,
+        },
+      ]
+    );
+
+    expect(deleteAttempt(db, attemptId, user.id)).toBe(true);
+    expect(listAttempts(db, user.id, 'math')).toHaveLength(0);
   });
 });
