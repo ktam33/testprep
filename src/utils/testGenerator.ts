@@ -13,6 +13,8 @@ import {
   PassageAssignment,
 } from '@/utils/passageLayout';
 import { buildMathTestSchema, buildPassageTestSchema } from '@/utils/schemas';
+import { planMathTopics, planPassageTopics, TopicSeed } from '@/utils/topics';
+import { reorderChoices } from '@/utils/answerShuffle';
 import { validateFigure } from '@/utils/figureValidation';
 import {
   Section,
@@ -33,7 +35,12 @@ export interface CategoryWeighting {
   correct: number;
 }
 
-export type GeneratedTestContent = { passages: PersistPassageInput[]; questions: PersistQuestionInput[] };
+export type GeneratedTestContent = {
+  passages: PersistPassageInput[];
+  questions: PersistQuestionInput[];
+  // Subjects this test was seeded with; persisted so later generations can avoid them.
+  topicLabels: string[];
+};
 
 // Science categories that are meaningless without an actual table/graph to look at.
 const DATA_INTERPRETATION_CATEGORIES = new Set(['Tables', 'Graphs', 'Trends & Data Comparison']);
@@ -69,17 +76,21 @@ function buildSystemMessage(section: Section): string {
   return `You are an expert item-writer creating official-style PreACT 9 Secure practice questions for the ${SECTION_LABELS[section]} section. Match real PreACT style, a 9th-grade reading level, and realistic difficulty. Every question must have exactly 4 answer choices with exactly one correct answer. Return only the structured JSON data requested — no extra commentary, no markdown.`;
 }
 
-function buildPassageUserMessage(section: Section, passages: PassageAssignment[]): string {
+function buildPassageUserMessage(
+  section: Section,
+  passages: PassageAssignment[],
+  topicInstructions: string[] = []
+): string {
   const lengthGuidance = section === 'science' ? 'about 150-300 words' : 'about 250-400 words';
 
   const totalQuestions = passages.reduce((sum, p) => sum + p.questionCount, 0);
 
   const passageInstructions = passages
-    .map(
-      (p) =>
-        `Passage ${p.index} (type: "${p.type}"): write ${lengthGuidance}, followed by exactly ${p.questionCount} questions (question "index" 0-${p.questionCount - 1} within this passage). Suggested category mix for this passage's questions: ${formatTally(p.categoryNames)}.`
-    )
-    .join('\n');
+    .map((p, i) => {
+      const topic = topicInstructions[i] ? `\n${topicInstructions[i]}` : '';
+      return `Passage ${p.index} (type: "${p.type}"): write ${lengthGuidance}, followed by exactly ${p.questionCount} questions (question "index" 0-${p.questionCount - 1} within this passage). Suggested category mix for this passage's questions: ${formatTally(p.categoryNames)}.${topic}`;
+    })
+    .join('\n\n');
 
   const figureGuidance =
     section === 'science'
@@ -123,22 +134,24 @@ For every question:
 - correctAnswerIndex is 0-based (0-3).
 - category must exactly match one of the category names listed above for that question's passage.
 - explanation should be 1-2 sentences justifying the correct answer, written for a 9th-grade student.
+- explanation must never refer to a choice by letter or position ("choice A", "the second option"); quote or describe the choice's actual wording instead, because answer order is randomized after generation.
 ${figureGuidance}${englishGuidance}
 Passage "index" fields must be 0-${passages.length - 1}, in the order listed above.`;
 }
 
-function buildMathUserMessage(flatList: CategoryToken[]): string {
+function buildMathUserMessage(flatList: CategoryToken[], topicInstruction = ''): string {
   return `Generate a full Math practice test: exactly 30 standalone questions (no passages, no shared context between questions).
 
 Required category distribution across the 30 questions: ${formatTally(flatList.map((t) => t.categoryName))}.
 
 Aim for a difficulty mix of roughly 30% easy, 40% medium, 30% hard.
-
+${topicInstruction ? `\n${topicInstruction}\n` : ''}
 For every question:
 - Provide exactly 4 answer choices (numeric or symbolic as appropriate).
 - correctAnswerIndex is 0-based (0-3).
 - category must exactly match one of the category names listed above.
 - explanation should be 1-2 sentences justifying the correct answer, written for a 9th-grade student.
+- explanation must never refer to a choice by letter or position ("choice A", "the second option"); quote or describe the choice's actual wording instead, because answer order is randomized after generation.
 - index is the question's 0-based position in the overall 30-question test (0-29).
 - Write every mathematical expression as LaTeX wrapped in \\( ... \\) delimiters — in the prompt, in EACH of the four answer choices, and in the explanation. For example an answer choice must be "\\(\\dfrac{11}{12}\\)", never a bare "\\dfrac{11}{12}" or "11/12". Plain non-mathematical words stay outside the delimiters.
 - Every question has a "figure" field. For Statistics & Probability, Coordinate Plane & Graphing, and Slope & Linear Relationships questions, often (not always) give it a real table (kind: "table") or chart (kind: "bar"/"line"/"scatter", with concrete x/y points, roughly 4-8 points for legibility) that the question actually depends on. For all other questions, and for any of those categories where a figure isn't a natural fit, set "figure" to exactly { "kind": "none", "title": "", "xLabel": "", "yLabel": "", "columns": [], "rows": [], "series": [] }.`;
@@ -287,21 +300,28 @@ function collapseFigure(figure: Figure | undefined): Figure | null {
   return !figure || figure.kind === 'none' ? null : figure;
 }
 
-function flattenGenerated(section: Section, parsed: GeneratedMathTest | GeneratedPassageTest): GeneratedTestContent {
+function flattenGenerated(
+  section: Section,
+  parsed: GeneratedMathTest | GeneratedPassageTest,
+  topicLabels: string[]
+): GeneratedTestContent {
   if (section === 'math') {
     const generated = parsed as GeneratedMathTest;
-    const questions: PersistQuestionInput[] = generated.questions.map((q: GeneratedQuestion, i: number) => ({
-      questionIndex: i,
-      passageIndex: null,
-      categoryName: q.category,
-      difficulty: q.difficulty,
-      prompt: q.prompt,
-      choices: q.choices,
-      correctAnswerIndex: q.correctAnswerIndex,
-      explanation: q.explanation,
-      figure: collapseFigure(q.figure),
-    }));
-    return { passages: [], questions };
+    const questions: PersistQuestionInput[] = generated.questions.map((q: GeneratedQuestion, i: number) => {
+      const ordered = reorderChoices(q.choices, q.correctAnswerIndex);
+      return {
+        questionIndex: i,
+        passageIndex: null,
+        categoryName: q.category,
+        difficulty: q.difficulty,
+        prompt: q.prompt,
+        choices: ordered.choices,
+        correctAnswerIndex: ordered.correctAnswerIndex,
+        explanation: q.explanation,
+        figure: collapseFigure(q.figure),
+      };
+    });
+    return { passages: [], questions, topicLabels };
   }
 
   const generated = parsed as GeneratedPassageTest;
@@ -332,22 +352,25 @@ function flattenGenerated(section: Section, parsed: GeneratedMathTest | Generate
         ? new Set((p.segments ?? []).map((s) => s.questionRef).filter((r) => r !== -1))
         : new Set<number>();
     p.questions.forEach((q: GeneratedQuestion, qi: number) => {
-      const choices = underlined.has(qi) ? ['NO CHANGE', ...q.choices.slice(1)] : q.choices;
+      const isUnderlined = underlined.has(qi);
+      const normalized = isUnderlined ? ['NO CHANGE', ...q.choices.slice(1)] : q.choices;
+      // Underlined items keep "NO CHANGE" in slot 0 (ACT convention) and shuffle only 1-3.
+      const ordered = reorderChoices(normalized, q.correctAnswerIndex, { pinFirstChoice: isUnderlined });
       questions.push({
         questionIndex: runningIndex++,
         passageIndex: passageIdx,
         categoryName: q.category,
         difficulty: q.difficulty,
         prompt: q.prompt,
-        choices,
-        correctAnswerIndex: q.correctAnswerIndex,
+        choices: ordered.choices,
+        correctAnswerIndex: ordered.correctAnswerIndex,
         explanation: q.explanation,
         figure: null, // passage-based questions never carry their own figure — it lives on the passage
       });
     });
   });
 
-  return { passages, questions };
+  return { passages, questions, topicLabels };
 }
 
 /**
@@ -357,8 +380,15 @@ function flattenGenerated(section: Section, parsed: GeneratedMathTest | Generate
  *
  * `categoryWeighting` drives the adaptive question allocation; pass a user's real stats for
  * an adaptive test, or all-zero stats for a generic/cold-start test.
+ *
+ * `recentTopics` are subjects to steer away from (see getRecentTopicSeeds). Kept as a plain
+ * argument rather than a db lookup so this module stays database-free.
  */
-export async function generateTest(section: Section, categoryWeighting: CategoryWeighting[]): Promise<GeneratedTestContent> {
+export async function generateTest(
+  section: Section,
+  categoryWeighting: CategoryWeighting[],
+  recentTopics: string[] = []
+): Promise<GeneratedTestContent> {
   const startTime = Date.now();
   if (!process.env.OPENAI_API_KEY) throw new Error('OpenAI API key is not configured');
 
@@ -379,12 +409,21 @@ export async function generateTest(section: Section, categoryWeighting: Category
   let passageSkeleton: PassageAssignment[] | null = null;
   let flatList: CategoryToken[] | null = null;
 
+  // Topic seeding: without it every call — including the parallel per-passage calls, which
+  // are otherwise byte-identical — converges on the model's modal subject.
+  let topicSeeds: TopicSeed[];
+
   if (layout.kind === 'passages') {
     const eligibilityMap = section === 'science' ? SCIENCE_ELIGIBILITY_MAP : undefined;
     passageSkeleton = assignCategoriesToPassages(categoryAllocations, layout.passages, eligibilityMap);
+    topicSeeds = planPassageTopics(section, passageSkeleton.map((p) => p.type), recentTopics);
   } else {
     flatList = buildFlatQuestionList(categoryAllocations);
+    topicSeeds = [planMathTopics(recentTopics)];
   }
+
+  const topicLabels = topicSeeds.flatMap((s) => s.labels);
+  console.log(`🔵 [GENERATE] ${section} topics (avoiding ${recentTopics.length} recent): ${topicLabels.join(', ')}`);
 
   const schema =
     layout.kind === 'passages'
@@ -418,8 +457,8 @@ export async function generateTest(section: Section, categoryWeighting: Category
   // Generates one passage (with its questions) in its own call, retrying up to
   // MAX_PASSAGE_ATTEMPTS times on EITHER a validation failure OR an exception (timeout /
   // transient API error), so one bad call self-heals rather than failing the whole test.
-  async function generateOnePassage(pa: PassageAssignment): Promise<GeneratedPassage> {
-    const message = buildPassageUserMessage(section, [{ ...pa, index: 0 }]);
+  async function generateOnePassage(pa: PassageAssignment, seed: TopicSeed): Promise<GeneratedPassage> {
+    const message = buildPassageUserMessage(section, [{ ...pa, index: 0 }], [seed.instruction]);
     const expected: PassageExpectation = { index: pa.index, type: pa.type, questionCount: pa.questionCount };
     const extract = (p: GeneratedMathTest | GeneratedPassageTest): GeneratedPassage => {
       const list = (p as GeneratedPassageTest).passages ?? [];
@@ -454,13 +493,15 @@ export async function generateTest(section: Section, categoryWeighting: Category
 
   if (layout.kind === 'passages') {
     console.log(`🔵 [GENERATE] Generating ${passageSkeleton!.length} ${section} passages in parallel...`);
-    const generatedPassages = await Promise.all(passageSkeleton!.map((pa) => generateOnePassage(pa)));
+    const generatedPassages = await Promise.all(
+      passageSkeleton!.map((pa, i) => generateOnePassage(pa, topicSeeds[i]))
+    );
     parsed = { passages: generatedPassages };
     const validation = validateGenerated(section, parsed, passageSkeleton);
     if (!validation.ok) throw new Error(`Generated test failed validation: ${validation.reason}`);
   } else {
     console.log('🔵 [GENERATE] Calling OpenAI (Math)...');
-    const mathMessage = buildMathUserMessage(flatList!);
+    const mathMessage = buildMathUserMessage(flatList!, topicSeeds[0].instruction);
     parsed = await runCompletion(mathMessage);
     let validation = validateGenerated(section, parsed, passageSkeleton);
     if (!validation.ok) {
@@ -510,5 +551,5 @@ export async function generateTest(section: Section, categoryWeighting: Category
     }
   }
 
-  return flattenGenerated(section, parsed);
+  return flattenGenerated(section, parsed, topicLabels);
 }

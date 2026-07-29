@@ -10,6 +10,7 @@ import {
   getAttemptDetail,
   getCategoryStats,
   getProgressSummary,
+  getRecentTopicSeeds,
   insertPregeneratedTest,
   listAttempts,
   listUsers,
@@ -68,6 +69,99 @@ function categoryIdsFor(section: 'english' | 'math' | 'reading' | 'science') {
     }[]
   );
 }
+
+describe('getRecentTopicSeeds', () => {
+  function attemptWithTopics(userId: number, section: 'math' | 'science', topics: string[]) {
+    const [cat] = categoryIdsFor(section);
+    return persistGeneratedTest(
+      db,
+      userId,
+      section,
+      [],
+      [
+        {
+          questionIndex: 0,
+          passageIndex: null,
+          categoryName: cat.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'because',
+          figure: null,
+        },
+      ],
+      null,
+      topics
+    );
+  }
+
+  it('returns nothing for a user with no history', () => {
+    const user = createUser(db, 'Alice');
+    expect(getRecentTopicSeeds(db, user.id, 'math')).toEqual([]);
+  });
+
+  it('accumulates labels across attempts', () => {
+    const user = createUser(db, 'Alice');
+    attemptWithTopics(user.id, 'math', ['a bakery', 'bus routes']);
+    attemptWithTopics(user.id, 'math', ['solar panels']);
+
+    expect(getRecentTopicSeeds(db, user.id, 'math').sort()).toEqual(['a bakery', 'bus routes', 'solar panels']);
+  });
+
+  it('includes topics from unconsumed pool entries', () => {
+    const user = createUser(db, 'Alice');
+    insertPregeneratedTest(db, user.id, 'math', '{}', ['a food truck']);
+
+    expect(getRecentTopicSeeds(db, user.id, 'math')).toContain('a food truck');
+  });
+
+  it('keeps avoiding a pool entry topic after it is consumed, via its attempt', () => {
+    const user = createUser(db, 'Alice');
+    const pregenId = insertPregeneratedTest(db, user.id, 'math', '{}', ['a food truck']);
+    db.prepare('UPDATE pregenerated_tests SET consumed = 1 WHERE id = ?').run(pregenId);
+
+    // Consumed pool rows drop out, but the attempt they produced carries the topics forward.
+    expect(getRecentTopicSeeds(db, user.id, 'math')).toEqual([]);
+    attemptWithTopics(user.id, 'math', ['a food truck']);
+    expect(getRecentTopicSeeds(db, user.id, 'math')).toEqual(['a food truck']);
+  });
+
+  it('de-duplicates a topic present in both the pool and history', () => {
+    const user = createUser(db, 'Alice');
+    attemptWithTopics(user.id, 'math', ['a bakery']);
+    insertPregeneratedTest(db, user.id, 'math', '{}', ['a bakery']);
+
+    expect(getRecentTopicSeeds(db, user.id, 'math')).toEqual(['a bakery']);
+  });
+
+  it('isolates topics by user and by section', () => {
+    const alice = createUser(db, 'Alice');
+    const bob = createUser(db, 'Bob');
+    attemptWithTopics(alice.id, 'math', ['a bakery']);
+    attemptWithTopics(alice.id, 'science', ['microbiology']);
+    attemptWithTopics(bob.id, 'math', ['bus routes']);
+
+    expect(getRecentTopicSeeds(db, alice.id, 'math')).toEqual(['a bakery']);
+    expect(getRecentTopicSeeds(db, alice.id, 'science')).toEqual(['microbiology']);
+    expect(getRecentTopicSeeds(db, bob.id, 'math')).toEqual(['bus routes']);
+  });
+
+  it('honours the attempt limit', () => {
+    const user = createUser(db, 'Alice');
+    for (const topic of ['one', 'two', 'three', 'four']) attemptWithTopics(user.id, 'math', [topic]);
+
+    expect(getRecentTopicSeeds(db, user.id, 'math', 2).sort()).toEqual(['four', 'three']);
+  });
+
+  it('ignores attempts persisted without topics', () => {
+    const user = createUser(db, 'Alice');
+    attemptWithTopics(user.id, 'math', []);
+    attemptWithTopics(user.id, 'math', ['a bakery']);
+
+    expect(getRecentTopicSeeds(db, user.id, 'math')).toEqual(['a bakery']);
+  });
+});
 
 describe('getCategoryStats', () => {
   it('returns every category for a section, including never-attempted ones (cold start)', () => {
