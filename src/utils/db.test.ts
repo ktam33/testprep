@@ -578,6 +578,137 @@ describe('deleteAttempt', () => {
   });
 });
 
+describe('deleteAttempt + the pre-generation pool', () => {
+  // Pool content is opaque here; only the pool bookkeeping matters for these tests.
+  function poolContent() {
+    const [cat] = categoryIdsFor('math');
+    return JSON.stringify({
+      passages: [],
+      questions: [
+        {
+          questionIndex: 0,
+          passageIndex: null,
+          categoryName: cat.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: null,
+        },
+      ],
+    });
+  }
+
+  function attemptFromPool(userId: number, poolId: number) {
+    const [cat] = categoryIdsFor('math');
+    return persistGeneratedTest(
+      db,
+      userId,
+      'math',
+      [],
+      [
+        {
+          questionIndex: 0,
+          passageIndex: null,
+          categoryName: cat.name,
+          difficulty: 'easy',
+          prompt: 'Q1',
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: null,
+        },
+      ],
+      poolId
+    );
+  }
+
+  it('leaves waiting pool tests in place — they are not invalidated by a delete', () => {
+    const user = createUser(db, 'Alice');
+    insertPregeneratedTest(db, user.id, 'math', poolContent());
+    insertPregeneratedTest(db, user.id, 'math', poolContent());
+    insertPregeneratedTest(db, user.id, 'reading', poolContent());
+
+    const poolId = insertPregeneratedTest(db, user.id, 'math', poolContent());
+    const attemptId = attemptFromPool(user.id, poolId);
+    const q = getAttemptDetail(db, attemptId, { includeAnswers: true })!.questions[0];
+    submitAttempt(db, attemptId, [{ questionId: q.id, selectedAnswerIndex: 0 }]);
+
+    // Submitting consumed the source test; the other three are still waiting.
+    expect(countAvailablePregen(db, user.id).math).toBe(2);
+    expect(countAvailablePregen(db, user.id).reading).toBe(1);
+
+    deleteAttempt(db, attemptId, user.id);
+
+    expect(countAvailablePregen(db, user.id).math).toBe(2);
+    expect(countAvailablePregen(db, user.id).reading).toBe(1);
+    expect(claimPregeneratedTest(db, user.id, 'math')).not.toBeNull();
+  });
+
+  it('does not resurrect the consumed pool test the deleted attempt came from', () => {
+    const user = createUser(db, 'Alice');
+    const poolId = insertPregeneratedTest(db, user.id, 'math', poolContent());
+    const attemptId = attemptFromPool(user.id, poolId);
+    const q = getAttemptDetail(db, attemptId, { includeAnswers: true })!.questions[0];
+    submitAttempt(db, attemptId, [{ questionId: q.id, selectedAnswerIndex: 0 }]);
+    expect(countAvailablePregen(db, user.id).math).toBe(0);
+
+    // The student has already seen this content — deleting the attempt must not put it
+    // back into circulation.
+    deleteAttempt(db, attemptId, user.id);
+    expect(countAvailablePregen(db, user.id).math).toBe(0);
+    expect(claimPregeneratedTest(db, user.id, 'math')).toBeNull();
+  });
+
+  it('feeds corrected stats to the next generation, which is where deletion takes effect', () => {
+    const user = createUser(db, 'Alice');
+    const [cat1] = categoryIdsFor('math');
+
+    // Two graded attempts on the same category: one all-wrong, one all-right.
+    function graded(allCorrect: boolean) {
+      const attemptId = persistGeneratedTest(
+        db,
+        user.id,
+        'math',
+        [],
+        [0, 1].map((i) => ({
+          questionIndex: i,
+          passageIndex: null,
+          categoryName: cat1.name,
+          difficulty: 'easy' as const,
+          prompt: `Q${i}`,
+          choices: ['a', 'b', 'c', 'd'],
+          correctAnswerIndex: 0,
+          explanation: 'x',
+          figure: null,
+        }))
+      );
+      const detail = getAttemptDetail(db, attemptId, { includeAnswers: true })!;
+      submitAttempt(
+        db,
+        attemptId,
+        detail.questions.map((q) => ({ questionId: q.id, selectedAnswerIndex: allCorrect ? 0 : 3 }))
+      );
+      return attemptId;
+    }
+
+    graded(true);
+    const badAttemptId = graded(false);
+
+    const before = getCategoryStats(db, user.id, 'math').find((s) => s.categoryId === cat1.id)!;
+    expect({ attempts: before.attempts, correct: before.correct }).toEqual({ attempts: 4, correct: 2 });
+
+    deleteAttempt(db, badAttemptId, user.id);
+
+    // getCategoryStats is what both pregenManager (pool refill) and the on-demand path in
+    // /api/tests/generate pass to allocateQuestions, and it is recomputed per call — so
+    // the very next generated test is weighted as if the deleted attempt never happened.
+    const after = getCategoryStats(db, user.id, 'math').find((s) => s.categoryId === cat1.id)!;
+    expect({ attempts: after.attempts, correct: after.correct }).toEqual({ attempts: 2, correct: 2 });
+  });
+});
+
 describe('pre-generation pool', () => {
   // A minimal one-question math test payload, shaped like GeneratedTestContent.
   function mathContent() {
