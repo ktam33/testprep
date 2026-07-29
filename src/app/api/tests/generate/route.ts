@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb, getCategoryStats, persistGeneratedTest, claimPregeneratedTest } from '@/utils/db';
+import {
+  getDb,
+  getCategoryStats,
+  getRecentTopicSeeds,
+  persistGeneratedTest,
+  claimPregeneratedTest,
+} from '@/utils/db';
 import { generateTest, GeneratedTestContent } from '@/utils/testGenerator';
 import { triggerPregeneration } from '@/utils/pregenManager';
 import { Section, SECTIONS } from '@/types';
@@ -33,7 +39,15 @@ export async function POST(request: NextRequest) {
     const pregen = claimPregeneratedTest(db, userId, section);
     if (pregen) {
       const content = JSON.parse(pregen.content) as GeneratedTestContent;
-      const attemptId = persistGeneratedTest(db, userId, section, content.passages, content.questions, pregen.id);
+      const attemptId = persistGeneratedTest(
+        db,
+        userId,
+        section,
+        content.passages,
+        content.questions,
+        pregen.id,
+        content.topicLabels ?? [] // absent on pool entries generated before topic seeding
+      );
       console.log(`✅ [GENERATE API] Served pre-generated ${section} test in ${Date.now() - startTime}ms (attemptId=${attemptId})`);
       void triggerPregeneration(); // refill the pool in the background
       return NextResponse.json({ attemptId, source: 'pregenerated' });
@@ -51,8 +65,9 @@ export async function POST(request: NextRequest) {
       categoryStats.map((s) => `${s.categoryName}: ${s.correct}/${s.attempts}`).join(', ')
     );
 
-    const { passages, questions } = await generateTest(section, categoryStats);
-    const attemptId = persistGeneratedTest(db, userId, section, passages, questions);
+    const recentTopics = getRecentTopicSeeds(db, userId, section);
+    const { passages, questions, topicLabels } = await generateTest(section, categoryStats, recentTopics);
+    const attemptId = persistGeneratedTest(db, userId, section, passages, questions, null, topicLabels);
 
     console.log(`✅ [GENERATE API] Generated on-demand in ${Date.now() - startTime}ms (attemptId=${attemptId})`);
     void triggerPregeneration(); // warm the pool so the next request can be instant

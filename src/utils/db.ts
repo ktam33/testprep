@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS test_attempts (
   score_correct  INTEGER,
   score_total    INTEGER,
   started_at     TEXT NOT NULL DEFAULT (datetime('now')),
-  completed_at   TEXT
+  completed_at   TEXT,
+  topic_seeds    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS passages (
@@ -91,6 +92,7 @@ CREATE TABLE IF NOT EXISTS pregenerated_tests (
   section     TEXT NOT NULL CHECK (section IN ('english','math','reading','science')),
   content     TEXT NOT NULL,
   consumed    INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1)),
+  topic_seeds TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -146,6 +148,9 @@ export function createDb(filePath: string = defaultDbPath()): Database.Database 
   // Pools became per-user; drop any legacy user-agnostic pool rows from before the migration.
   ensureColumn(db, 'pregenerated_tests', 'user_id', 'INTEGER');
   db.exec('DELETE FROM pregenerated_tests WHERE user_id IS NULL');
+  // Subjects a test was seeded with, so later generations can avoid repeating them.
+  ensureColumn(db, 'test_attempts', 'topic_seeds', 'TEXT');
+  ensureColumn(db, 'pregenerated_tests', 'topic_seeds', 'TEXT');
   seedCategories(db);
   return db;
 }
@@ -326,7 +331,8 @@ export function persistGeneratedTest(
   section: Section,
   passages: PersistPassageInput[],
   questions: PersistQuestionInput[],
-  pregeneratedId: number | null = null
+  pregeneratedId: number | null = null,
+  topicLabels: string[] = []
 ): number {
   const categoryIdByName = new Map<string, number>(
     (db.prepare('SELECT id, name FROM categories WHERE section = ?').all(section) as any[]).map((r) => [
@@ -336,7 +342,7 @@ export function persistGeneratedTest(
   );
 
   const insertAttempt = db.prepare(
-    'INSERT INTO test_attempts (user_id, section, num_questions, pregenerated_id) VALUES (?, ?, ?, ?)'
+    'INSERT INTO test_attempts (user_id, section, num_questions, pregenerated_id, topic_seeds) VALUES (?, ?, ?, ?, ?)'
   );
   const insertPassage = db.prepare(
     'INSERT INTO passages (test_attempt_id, passage_index, passage_type, title, body, segments, figure) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -348,7 +354,13 @@ export function persistGeneratedTest(
   );
 
   const run = db.transaction(() => {
-    const attemptId = insertAttempt.run(userId, section, questions.length, pregeneratedId).lastInsertRowid as number;
+    const attemptId = insertAttempt.run(
+      userId,
+      section,
+      questions.length,
+      pregeneratedId,
+      topicLabels.length > 0 ? JSON.stringify(topicLabels) : null
+    ).lastInsertRowid as number;
 
     const passageIdByIndex = new Map<number, number>();
     for (const p of passages) {
@@ -398,11 +410,13 @@ export function insertPregeneratedTest(
   db: Database.Database,
   userId: number,
   section: Section,
-  content: string
+  content: string,
+  topicLabels: string[] = []
 ): number {
   return db
-    .prepare('INSERT INTO pregenerated_tests (user_id, section, content) VALUES (?, ?, ?)')
-    .run(userId, section, content).lastInsertRowid as number;
+    .prepare('INSERT INTO pregenerated_tests (user_id, section, content, topic_seeds) VALUES (?, ?, ?, ?)')
+    .run(userId, section, content, topicLabels.length > 0 ? JSON.stringify(topicLabels) : null)
+    .lastInsertRowid as number;
 }
 
 // Available (unconsumed) pool tests per section, for a single user.
@@ -426,6 +440,56 @@ export function claimPregeneratedTest(
     .prepare('SELECT id, content FROM pregenerated_tests WHERE user_id = ? AND section = ? AND consumed = 0 ORDER BY id LIMIT 1')
     .get(userId, section) as { id: number; content: string } | undefined;
   return row ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Topic history (feeds the generator's avoid-list)
+// ---------------------------------------------------------------------------
+
+function parseTopicSeedRows(rows: { topic_seeds: string }[]): string[] {
+  const labels: string[] = [];
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.topic_seeds);
+      if (Array.isArray(parsed)) labels.push(...parsed.filter((x): x is string => typeof x === 'string'));
+    } catch {
+      // A malformed row just means one fewer topic to avoid — never worth failing generation.
+    }
+  }
+  return labels;
+}
+
+/**
+ * Subjects to steer a new test away from: those used by the user's recent attempts, plus
+ * those sitting in their unconsumed pool.
+ *
+ * The pool half matters as much as the history half. The background fill loop generates
+ * several tests back-to-back, and each one reads this list before generating — without the
+ * pool entries here, two pool tests made a minute apart would avoid the same past subjects
+ * but happily duplicate each other.
+ */
+export function getRecentTopicSeeds(
+  db: Database.Database,
+  userId: number,
+  section: Section,
+  attemptLimit = 6
+): string[] {
+  const attemptRows = db
+    .prepare(
+      `SELECT topic_seeds FROM test_attempts
+       WHERE user_id = ? AND section = ? AND topic_seeds IS NOT NULL
+       ORDER BY id DESC LIMIT ?`
+    )
+    .all(userId, section, attemptLimit) as { topic_seeds: string }[];
+
+  const poolRows = db
+    .prepare(
+      `SELECT topic_seeds FROM pregenerated_tests
+       WHERE user_id = ? AND section = ? AND consumed = 0 AND topic_seeds IS NOT NULL`
+    )
+    .all(userId, section) as { topic_seeds: string }[];
+
+  return [...new Set([...parseTopicSeedRows(poolRows), ...parseTopicSeedRows(attemptRows)])];
 }
 
 // ---------------------------------------------------------------------------

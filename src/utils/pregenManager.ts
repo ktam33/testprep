@@ -1,4 +1,11 @@
-import { getDb, countAvailablePregen, insertPregeneratedTest, getCategoryStats, listUsers } from '@/utils/db';
+import {
+  getDb,
+  countAvailablePregen,
+  insertPregeneratedTest,
+  getCategoryStats,
+  getRecentTopicSeeds,
+  listUsers,
+} from '@/utils/db';
 import { generateTest } from '@/utils/testGenerator';
 import { Section, SECTIONS } from '@/types';
 
@@ -80,8 +87,11 @@ export async function triggerPregeneration(): Promise<void> {
         const db = getDb();
         // Adaptive: weight the pool test by this user's real performance history.
         const stats = getCategoryStats(db, slot.userId, slot.section);
-        const content = await generateTest(slot.section, stats);
-        insertPregeneratedTest(db, slot.userId, slot.section, JSON.stringify(content));
+        // Read fresh each iteration: the entry inserted by the previous pass is already in
+        // the pool, so consecutive pool tests steer away from each other, not just history.
+        const recentTopics = getRecentTopicSeeds(db, slot.userId, slot.section);
+        const content = await generateTest(slot.section, stats, recentTopics);
+        insertPregeneratedTest(db, slot.userId, slot.section, JSON.stringify(content), content.topicLabels);
         state.lastError = null;
         consecutiveFailures = 0;
         console.log(`✅ [PREGEN] Stored a ${slot.section} test for user ${slot.userId}`);
