@@ -34,6 +34,9 @@ export default function UserBar() {
             <span>
               Practicing as <strong className="text-gray-900">{name}</strong>
             </span>
+            <Link href="/admin" className="text-blue-600 hover:underline">
+              Admin
+            </Link>
             <button type="button" onClick={switchProfile} className="text-blue-600 hover:underline">
               Switch profile
             </button>

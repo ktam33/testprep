@@ -81,10 +81,24 @@ CREATE TABLE IF NOT EXISTS responses (
   answered_at            TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Per-user pool of ready-made, adaptively-generated tests produced by the background
+-- generator. "content" is the JSON { passages, questions } persist payload. A pool test
+-- stays "available" (consumed = 0) until an attempt derived from it is actually submitted,
+-- so an unsubmitted (abandoned) attempt leaves its source test reusable.
+CREATE TABLE IF NOT EXISTS pregenerated_tests (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  section     TEXT NOT NULL CHECK (section IN ('english','math','reading','science')),
+  content     TEXT NOT NULL,
+  consumed    INTEGER NOT NULL DEFAULT 0 CHECK (consumed IN (0,1)),
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_test_attempts_user  ON test_attempts(user_id);
 CREATE INDEX IF NOT EXISTS idx_questions_attempt   ON questions(test_attempt_id);
 CREATE INDEX IF NOT EXISTS idx_questions_category  ON questions(category_id);
 CREATE INDEX IF NOT EXISTS idx_passages_attempt    ON passages(test_attempt_id);
+CREATE INDEX IF NOT EXISTS idx_pregenerated_avail  ON pregenerated_tests(user_id, section, consumed);
 `;
 
 function defaultDbPath(): string {
@@ -126,6 +140,12 @@ export function createDb(filePath: string = defaultDbPath()): Database.Database 
   ensureColumn(db, 'passages', 'figure', 'TEXT');
   ensureColumn(db, 'passages', 'segments', 'TEXT');
   ensureColumn(db, 'questions', 'figure', 'TEXT');
+  // Links an attempt back to the pool test it came from, so submitting the attempt can
+  // mark that pool test consumed. Null for on-demand (non-pool) attempts.
+  ensureColumn(db, 'test_attempts', 'pregenerated_id', 'INTEGER');
+  // Pools became per-user; drop any legacy user-agnostic pool rows from before the migration.
+  ensureColumn(db, 'pregenerated_tests', 'user_id', 'INTEGER');
+  db.exec('DELETE FROM pregenerated_tests WHERE user_id IS NULL');
   seedCategories(db);
   return db;
 }
@@ -305,7 +325,8 @@ export function persistGeneratedTest(
   userId: number,
   section: Section,
   passages: PersistPassageInput[],
-  questions: PersistQuestionInput[]
+  questions: PersistQuestionInput[],
+  pregeneratedId: number | null = null
 ): number {
   const categoryIdByName = new Map<string, number>(
     (db.prepare('SELECT id, name FROM categories WHERE section = ?').all(section) as any[]).map((r) => [
@@ -315,7 +336,7 @@ export function persistGeneratedTest(
   );
 
   const insertAttempt = db.prepare(
-    'INSERT INTO test_attempts (user_id, section, num_questions) VALUES (?, ?, ?)'
+    'INSERT INTO test_attempts (user_id, section, num_questions, pregenerated_id) VALUES (?, ?, ?, ?)'
   );
   const insertPassage = db.prepare(
     'INSERT INTO passages (test_attempt_id, passage_index, passage_type, title, body, segments, figure) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -327,7 +348,7 @@ export function persistGeneratedTest(
   );
 
   const run = db.transaction(() => {
-    const attemptId = insertAttempt.run(userId, section, questions.length).lastInsertRowid as number;
+    const attemptId = insertAttempt.run(userId, section, questions.length, pregeneratedId).lastInsertRowid as number;
 
     const passageIdByIndex = new Map<number, number>();
     for (const p of passages) {
@@ -367,6 +388,44 @@ export function persistGeneratedTest(
   });
 
   return run();
+}
+
+// ---------------------------------------------------------------------------
+// Pre-generation pool (per user)
+// ---------------------------------------------------------------------------
+
+export function insertPregeneratedTest(
+  db: Database.Database,
+  userId: number,
+  section: Section,
+  content: string
+): number {
+  return db
+    .prepare('INSERT INTO pregenerated_tests (user_id, section, content) VALUES (?, ?, ?)')
+    .run(userId, section, content).lastInsertRowid as number;
+}
+
+// Available (unconsumed) pool tests per section, for a single user.
+export function countAvailablePregen(db: Database.Database, userId: number): Record<Section, number> {
+  const rows = db
+    .prepare('SELECT section, COUNT(*) AS n FROM pregenerated_tests WHERE user_id = ? AND consumed = 0 GROUP BY section')
+    .all(userId) as { section: Section; n: number }[];
+  const counts = Object.fromEntries(SECTIONS.map((s) => [s, 0])) as Record<Section, number>;
+  for (const r of rows) counts[r.section] = r.n;
+  return counts;
+}
+
+// Returns the oldest available pool test for a user+section without consuming it (it is only
+// consumed once an attempt derived from it is submitted). Null if that pool is empty.
+export function claimPregeneratedTest(
+  db: Database.Database,
+  userId: number,
+  section: Section
+): { id: number; content: string } | null {
+  const row = db
+    .prepare('SELECT id, content FROM pregenerated_tests WHERE user_id = ? AND section = ? AND consumed = 0 ORDER BY id LIMIT 1')
+    .get(userId, section) as { id: number; content: string } | undefined;
+  return row ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +524,15 @@ export function submitAttempt(
       insertResponse.run(r.questionId, r.selectedAnswerIndex, r.isCorrect ? 1 : 0);
     }
     updateAttempt.run(scoreCorrect, scoreTotal, attemptId);
+
+    // If this attempt came from the pre-generation pool, submitting it consumes the source
+    // test for good (an unsubmitted/abandoned attempt would have left it reusable).
+    const row = db.prepare('SELECT pregenerated_id FROM test_attempts WHERE id = ?').get(attemptId) as
+      | { pregenerated_id: number | null }
+      | undefined;
+    if (row?.pregenerated_id != null) {
+      db.prepare('UPDATE pregenerated_tests SET consumed = 1 WHERE id = ?').run(row.pregenerated_id);
+    }
   });
   run();
 
