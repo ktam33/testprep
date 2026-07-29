@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { CategoryStat, Passage, Question, SECTION_LABELS, TestAttemptDetail } from '@/types';
+import { getCurrentUser } from '@/utils/session';
 import PassageView from '@/components/PassageView';
 import QuestionCard from '@/components/QuestionCard';
 import ResultsSummary from '@/components/ResultsSummary';
@@ -39,6 +40,11 @@ export default function ResultsPage() {
   const [responsesByQuestionId, setResponsesByQuestionId] = useState<Record<number, number | null>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  // Kept separate from `error`: a load failure replaces the page, a delete failure
+  // should leave the results on screen and just report itself.
+  const [deleteError, setDeleteError] = useState('');
 
   useEffect(() => {
     load();
@@ -67,6 +73,27 @@ export default function ResultsPage() {
       setError(err.message);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (!attempt) return;
+    const user = getCurrentUser();
+    if (!user) {
+      router.replace('/');
+      return;
+    }
+    setDeleting(true);
+    setDeleteError('');
+    try {
+      const res = await fetch(`/api/tests/${attemptId}?userId=${user.id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to delete attempt');
+      router.replace(`/sections/${attempt.section}`);
+    } catch (err: any) {
+      setDeleteError(err.message);
+      setDeleting(false);
+      setConfirmingDelete(false);
     }
   }
 
@@ -125,13 +152,45 @@ export default function ResultsPage() {
         );
       })}
 
-      <div className="flex justify-center gap-4 pb-8">
-        <Link href={`/sections/${attempt.section}`} className="text-sm text-blue-600 hover:underline">
-          Back to {SECTION_LABELS[attempt.section]}
-        </Link>
-        <Link href="/dashboard" className="text-sm text-blue-600 hover:underline">
-          Dashboard
-        </Link>
+      <div className="flex flex-col items-center gap-3 pb-8">
+        {deleteError && <p className="text-sm text-red-600">{deleteError}</p>}
+        <div className="flex justify-center gap-4">
+          <Link href={`/sections/${attempt.section}`} className="text-sm text-blue-600 hover:underline">
+            Back to {SECTION_LABELS[attempt.section]}
+          </Link>
+          <Link href="/dashboard" className="text-sm text-blue-600 hover:underline">
+            Dashboard
+          </Link>
+        </div>
+        {confirmingDelete ? (
+          <div className="flex items-center gap-3 text-sm">
+            <span className="text-gray-600">
+              Delete this attempt? Its results stop counting toward your stats and the next test&apos;s
+              question mix.
+            </span>
+            <button
+              onClick={handleDelete}
+              disabled={deleting}
+              className="rounded-md bg-red-600 px-3 py-1 font-medium text-white hover:bg-red-700 disabled:opacity-50"
+            >
+              {deleting ? 'Deleting…' : 'Delete'}
+            </button>
+            <button
+              onClick={() => setConfirmingDelete(false)}
+              disabled={deleting}
+              className="rounded-md px-3 py-1 font-medium text-gray-600 hover:bg-gray-100 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setConfirmingDelete(true)}
+            className="text-sm text-gray-400 hover:text-red-600 hover:underline"
+          >
+            Delete this attempt
+          </button>
+        )}
       </div>
     </div>
   );

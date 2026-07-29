@@ -481,6 +481,23 @@ export function listAttempts(db: Database.Database, userId: number, section: Sec
   ).map(mapAttemptRow);
 }
 
+/**
+ * Permanently removes an attempt. Its passages, questions and responses go with it via
+ * ON DELETE CASCADE, so the attempt stops counting toward category accuracy, the
+ * dashboard averages, and the adaptive allocation that weights the next generated test.
+ * Scoped by user id so one profile can never delete another's attempt.
+ * Returns false when no attempt matched (unknown id, or owned by someone else).
+ *
+ * The user's pre-generated pool is deliberately left alone. Correcting for a deleted
+ * result is a generation-time concern: getCategoryStats() is recomputed on every call, so
+ * any test generated after this point (pool refill or on-demand) already excludes the
+ * deleted attempt. Tests sitting in the pool keep the weighting they were born with.
+ */
+export function deleteAttempt(db: Database.Database, attemptId: number, userId: number): boolean {
+  const info = db.prepare('DELETE FROM test_attempts WHERE id = ? AND user_id = ?').run(attemptId, userId);
+  return info.changes > 0;
+}
+
 // ---------------------------------------------------------------------------
 // Grading
 // ---------------------------------------------------------------------------
