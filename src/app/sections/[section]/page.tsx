@@ -51,6 +51,21 @@ export default function SectionDetailPage() {
     }
   }
 
+  async function deleteAttempt(attemptId: number) {
+    if (!userId) return;
+    setError('');
+    try {
+      const res = await fetch(`/api/tests/${attemptId}?userId=${userId}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to delete attempt');
+      // Reload rather than filter locally: category accuracy is recomputed without the
+      // deleted attempt, same as the weighting the next generated test will use.
+      await loadProgress(userId);
+    } catch (err: any) {
+      setError(err.message);
+    }
+  }
+
   async function startTest() {
     if (!userId) return;
     setGenerating(true);
@@ -94,7 +109,7 @@ export default function SectionDetailPage() {
 
       <section>
         <h2 className="mb-2 text-lg font-semibold text-gray-900">Attempt History</h2>
-        <AttemptHistoryList attempts={attempts} />
+        <AttemptHistoryList attempts={attempts} onDelete={deleteAttempt} />
       </section>
     </div>
   );
