@@ -1,0 +1,31 @@
+# Local container run. `docker compose up` → http://localhost:3001
+#
+# Deliberately not port 3000: that stays free for `npm run dev`, so the two can
+# run side by side without one silently shadowing the other.
+
+services:
+  app:
+    build: .
+    ports:
+      - "3001:3000"
+
+    # OPENAI_API_KEY and OPENAI_MODEL come from .env.local, same file the dev
+    # server uses. Copy it from .env.example first if you haven't.
+    env_file:
+      - .env.local
+
+    environment:
+      # The image runs with NODE_ENV=production, and src/proxy.ts refuses every
+      # request in production without a password — so one is required here even
+      # locally. Any username works at the browser prompt.
+      APP_PASSWORD: ${APP_PASSWORD:-local-dev}
+
+    # A named volume, not a bind mount to ./data. SQLite in WAL mode needs real
+    # file locking and shared memory, which Docker Desktop's virtualized
+    # filesystem does not reliably provide on macOS; pointing this at the live
+    # database risks corrupting it. See SETUP.md to seed it from a real snapshot.
+    volumes:
+      - testprep-data:/app/data
+
+volumes:
+  testprep-data:
