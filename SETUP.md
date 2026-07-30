@@ -51,6 +51,52 @@ npm run test:watch  # watch mode
 
 Tests cover the pure business logic (question-allocation weighting, passage layout, grading) and the SQLite data layer, run against an in-memory database — no OpenAI calls are made during tests.
 
+## Deploying to Fly.io
+
+The app keeps its SQLite file on disk and runs the pregeneration worker inside the server
+process, so it needs **one always-on machine with a persistent volume** — not a serverless
+platform. `fly.toml` pins `min_machines_running = 1` and disables auto-stop for that reason;
+don't scale past one machine, since a second one can't attach the same volume.
+
+1. **Install flyctl and sign in:**
+   ```bash
+   brew install flyctl && fly auth login
+   ```
+
+2. **Create the app and its volume:**
+   ```bash
+   fly launch --no-deploy    # keep the existing fly.toml when prompted
+   fly volumes create testprep_data --size 1 --region sea
+   ```
+
+3. **Set secrets.** `APP_PASSWORD` is the shared password for the site (see `src/proxy.ts`);
+   any username works at the browser prompt.
+   ```bash
+   fly secrets set OPENAI_API_KEY=sk-... OPENAI_MODEL=gpt-5.1 APP_PASSWORD=<choose-one>
+   ```
+
+4. **Deploy:**
+   ```bash
+   fly deploy
+   ```
+
+### Moving existing data up
+
+Don't copy the `.sqlite3` file on its own — WAL mode means recent writes may still be sitting
+in the `-wal` sidecar. `VACUUM INTO` writes a single consistent snapshot:
+
+```bash
+sqlite3 data/preact-testprep.sqlite3 "VACUUM INTO '/tmp/seed.sqlite3'"
+fly ssh sftp shell     # then: put /tmp/seed.sqlite3 /app/data/preact-testprep.sqlite3
+fly apps restart preact-testprep
+```
+
+### Backups
+
+Fly volumes are a single copy on one host. `fly volumes snapshots list <volume-id>` shows the
+automatic daily snapshots; for anything you'd actually want to restore from, run the
+`VACUUM INTO` above on a schedule and copy the result off-host.
+
 ## File Structure
 
 - `src/utils/db.ts` — SQLite connection, schema, seeding, query helpers

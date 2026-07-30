@@ -1,0 +1,23 @@
+app = "preact-testprep"
+primary_region = "sea"
+
+[build]
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  # The pregeneration worker (src/utils/pregenManager.ts) keeps its state in the
+  # process and assumes it is the only one running. Never let Fly stop the machine
+  # or start a second one: scaling to zero would abandon in-flight generation, and
+  # a second machine cannot attach to the same volume anyway.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+[mounts]
+  source = "testprep_data"
+  destination = "/app/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
