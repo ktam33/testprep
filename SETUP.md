@@ -66,7 +66,7 @@ don't scale past one machine, since a second one can't attach the same volume.
 2. **Create the app and its volume:**
    ```bash
    fly launch --no-deploy    # keep the existing fly.toml when prompted
-   fly volumes create testprep_data --size 1 --region sea
+   fly volumes create testprep_data --size 1 --region ord
    ```
 
 3. **Set secrets.** `APP_PASSWORD` is the shared password for the site (see `src/proxy.ts`);
