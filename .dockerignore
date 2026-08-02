@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.DS_Store
+
+# Local database and backups — the deployed app uses the Fly volume, and the
+# .sqlite3-wal file alone is larger than the rest of the image.
+data
+
+.env
+.env*.local
+*.tsbuildinfo
+npm-debug.log*
